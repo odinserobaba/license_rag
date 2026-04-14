@@ -1,0 +1,21 @@
+# Python cache / venv
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Project artifacts
+processed/
+!processed/.gitkeep
+doc/rename_map*.tsv
+*.log
+
+# Local models and heavy assets
+models/
+chroma_db/
