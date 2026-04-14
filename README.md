@@ -71,6 +71,30 @@ python3 scripts/build_index.py --chunks-jsonl processed/chunks.jsonl --output pr
 - Возвращает источники (тип документа, номер, исходный файл).
 - Работает полностью локально.
 
+## Две версии LLM-оценки
+
+### 1) Colab (T4) версия
+
+- Ноутбук: `notebooks/llm_eval_colab_t4.ipynb`
+- В Colab загрузите:
+  - `processed/lexical_index.json`
+  - `data/test/eval_questions.jsonl`
+- Выход:
+  - `eval_colab_t4.jsonl`
+
+### 2) Локальная версия (Ollama)
+
+```bash
+python3 scripts/llm_eval_local.py \
+  --index processed/lexical_index.json \
+  --questions data/test/eval_questions.jsonl \
+  --top-k 6 \
+  --model qwen2.5:7b-instruct \
+  --output processed/eval_local_llm.jsonl
+```
+
+Требуется запущенный локальный Ollama на `http://127.0.0.1:11434`.
+
 ## Структура проекта
 
 ```text
