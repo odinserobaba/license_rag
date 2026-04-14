@@ -67,8 +67,17 @@ def infer_doc_type(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def read_text_file(path: Path) -> str:
+    for enc in ("utf-8", "cp1251", "windows-1251"):
+        try:
+            return clean_text(path.read_text(encoding=enc))
+        except Exception:
+            continue
+    return clean_text(path.read_text(encoding="utf-8", errors="replace"))
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare extra corpus records from .doc/.docx files")
+    parser = argparse.ArgumentParser(description="Prepare extra corpus records from .doc/.docx/.txt/.md files")
     parser.add_argument("--input-dir", default="doc")
     parser.add_argument("--txt-dir", default="processed/clean_txt")
     parser.add_argument("--jsonl", default="processed/extra_docs.jsonl")
@@ -80,10 +89,19 @@ def main() -> None:
     txt_dir.mkdir(parents=True, exist_ok=True)
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(list(input_dir.glob("*.doc")) + list(input_dir.glob("*.DOC")) + list(input_dir.glob("*.docx")) + list(input_dir.glob("*.DOCX")))
+    files = sorted(
+        list(input_dir.glob("*.doc"))
+        + list(input_dir.glob("*.DOC"))
+        + list(input_dir.glob("*.docx"))
+        + list(input_dir.glob("*.DOCX"))
+        + list(input_dir.glob("*.txt"))
+        + list(input_dir.glob("*.TXT"))
+        + list(input_dir.glob("*.md"))
+        + list(input_dir.glob("*.MD"))
+    )
     if not files:
         out_jsonl.write_text("", encoding="utf-8")
-        print("No .doc/.docx files found")
+        print("No .doc/.docx/.txt/.md files found")
         print(f"JSONL file: {out_jsonl}")
         return
 
@@ -93,14 +111,16 @@ def main() -> None:
         suffix = path.suffix.lower()
         if suffix == ".docx":
             text = extract_docx_text(path)
-        else:
+        elif suffix == ".doc":
             text = extract_doc_text(path)
+        else:
+            text = read_text_file(path)
 
         if not text:
             skipped.append(path.name)
             continue
 
-        rec_id = f"{path.stem}_doc"
+        rec_id = f"{path.stem}_extra"
         txt_path = txt_dir / f"{rec_id}.txt"
         txt_path.write_text(text, encoding="utf-8")
         meta = {
@@ -117,8 +137,8 @@ def main() -> None:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    print(f"Processed DOC/DOCX files: {len(records)}")
-    print(f"Skipped DOC/DOCX files: {len(skipped)}")
+    print(f"Processed extra files (.doc/.docx/.txt/.md): {len(records)}")
+    print(f"Skipped extra files: {len(skipped)}")
     if skipped:
         print("Skipped list:", ", ".join(skipped))
         print("Hint: install antiword/catdoc/libreoffice for .doc support")

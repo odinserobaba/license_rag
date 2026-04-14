@@ -16,7 +16,26 @@ def tokenize(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text)]
 
 
-def score_query(query: str, index: dict) -> list[tuple[float, dict]]:
+def doc_weight(row: dict, official_only: bool) -> float:
+    meta = row.get("metadata", {})
+    source = (meta.get("source_file") or "").lower()
+    doc_type = (meta.get("doc_type") or "").upper()
+
+    is_official = doc_type in {"ПРИКАЗ", "ПОСТАНОВЛЕНИЕ", "РАСПОРЯЖЕНИЕ", "ФЕДЕРАЛЬНЫЙ ЗАКОН"}
+    if official_only and not is_official:
+        return 0.0
+
+    weight = 1.0
+    if is_official:
+        weight *= 1.25
+    if source.startswith("guide_"):
+        weight *= 0.75
+    if "unknown" in source:
+        weight *= 0.65
+    return weight
+
+
+def score_query(query: str, index: dict, official_only: bool) -> list[tuple[float, dict]]:
     q_tf = Counter(tokenize(query))
     if not q_tf:
         return []
@@ -25,6 +44,9 @@ def score_query(query: str, index: dict) -> list[tuple[float, dict]]:
     docs = index["docs"]
     scored: list[tuple[float, dict]] = []
     for d in docs:
+        w = doc_weight(d, official_only)
+        if w <= 0:
+            continue
         score = 0.0
         d_tf = d["tf"]
         d_len = max(1, d["len"])
@@ -32,7 +54,7 @@ def score_query(query: str, index: dict) -> list[tuple[float, dict]]:
             if tok in d_tf and tok in idf:
                 score += (qf * idf[tok]) * (d_tf[tok] * idf[tok] / math.sqrt(d_len))
         if score > 0:
-            scored.append((score, d))
+            scored.append((score * w, d))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored
 
@@ -62,12 +84,12 @@ def format_context(matches: list[tuple[float, dict]]) -> str:
     return "\n\n".join(lines)
 
 
-def answer(question: str, history: list[dict], top_k: int) -> str:
+def answer(question: str, history: list[dict], top_k: int, official_only: bool) -> str:
     if not question.strip():
         return "Введите вопрос по лицензированию ЕГАИС."
 
     top_k = max(1, min(int(top_k), 12))
-    matches = score_query(question, INDEX)[:top_k]
+    matches = score_query(question, INDEX, official_only=official_only)[:top_k]
     if not matches:
         return (
             "Не нашел релевантные фрагменты в локальной базе.\n\n"
@@ -95,7 +117,11 @@ demo = gr.ChatInterface(
             value=6,
             step=1,
             label="Top-K (количество найденных фрагментов)",
-        )
+        ),
+        gr.Checkbox(
+            value=True,
+            label="Только официальные НПА (рекомендуется)",
+        ),
     ],
     title="EGAIS Normatives Assistant (локально)",
     description=(

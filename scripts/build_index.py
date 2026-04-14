@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -14,6 +15,11 @@ def tokenize(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text)]
 
 
+def norm_text_for_hash(text: str) -> str:
+    text = re.sub(r"\s+", " ", text.strip().lower())
+    return text
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build lightweight lexical TF-IDF index from chunks")
     parser.add_argument("--chunks-jsonl", default="processed/chunks.jsonl")
@@ -26,10 +32,18 @@ def main() -> None:
 
     docs = []
     df = defaultdict(int)
+    seen_chunk_hashes = set()
+    skipped_duplicates = 0
 
     with chunks_path.open("r", encoding="utf-8") as f:
         for line in f:
             rec = json.loads(line)
+            normalized = norm_text_for_hash(rec["text"])
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            if digest in seen_chunk_hashes:
+                skipped_duplicates += 1
+                continue
+            seen_chunk_hashes.add(digest)
             tokens = tokenize(rec["text"])
             if not tokens:
                 continue
@@ -59,6 +73,7 @@ def main() -> None:
         json.dump(out, f, ensure_ascii=False)
 
     print(f"Indexed chunks: {n_docs}")
+    print(f"Skipped duplicate chunks: {skipped_duplicates}")
     print(f"Saved index: {out_path}")
 
 
