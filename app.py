@@ -104,6 +104,34 @@ LICENSE_ACTIVITY_CODES: list[tuple[str, str]] = [
     ("ПХП_ЭС", "производство хранение поставки этилового спирта"),
 ]
 
+OFFICIAL_REFERENCE_LINKS: list[dict] = [
+    {
+        "label": "Росалкогольтабакконтроль (официальный сайт)",
+        "url": "https://fsrar.gov.ru",
+        "tokens": ["росалкогольтабакконтроль", "фсрар", "росалкогольрегулирование"],
+    },
+    {
+        "label": "Государственный сводный реестр лицензий",
+        "url": "https://fsrar.gov.ru/srrlic",
+        "tokens": ["реестр лиценз", "сводный реестр", "srrlic"],
+    },
+    {
+        "label": "Федеральный закон № 171-ФЗ от 22.11.1995",
+        "url": "http://www.kremlin.ru/acts/bank/8506",
+        "tokens": ["171-фз", "федеральный закон № 171", "федерального закона № 171"],
+    },
+    {
+        "label": "Приказ Росалкогольрегулирования № 199 от 12.08.2019",
+        "url": "http://publication.pravo.gov.ru/document/0001202002030031",
+        "tokens": ["приказ №199", "приказ 199", "0001202002030031"],
+    },
+    {
+        "label": "Портал официальных публикаций правовых актов",
+        "url": "http://publication.pravo.gov.ru",
+        "tokens": ["приказ", "постановление", "федеральный закон", "нпа"],
+    },
+]
+
 
 def expand_query_for_activity_codes(query: str) -> str:
     q_low = query.lower()
@@ -1293,6 +1321,30 @@ def validate_answer_content(answer_text: str, matches: list[tuple[float, dict]])
     return "Проверка: ключевые сущности найдены частично или отсутствуют."
 
 
+def build_official_links_block(question: str, answer_text: str, matches: list[tuple[float, dict]]) -> str:
+    parts = [question or "", answer_text or ""]
+    for _, row in matches[:8]:
+        meta = row.get("metadata", {}) or {}
+        parts.append(doc_label(meta))
+        parts.append(row.get("text", "")[:300])
+    hay = "\n".join(parts).lower()
+
+    lines: list[str] = []
+    for ref in OFFICIAL_REFERENCE_LINKS:
+        if any(tok in hay for tok in ref["tokens"]):
+            lines.append(f"- [{ref['label']}]({ref['url']})")
+
+    # Keep at least core official links for legal answers.
+    if not lines and is_legal_query(question):
+        lines = [
+            "- [Росалкогольтабакконтроль (официальный сайт)](https://fsrar.gov.ru)",
+            "- [Портал официальных публикаций правовых актов](http://publication.pravo.gov.ru)",
+        ]
+    if not lines:
+        return ""
+    return "### Официальные ссылки\n" + "\n".join(lines)
+
+
 def answer(
     question: str,
     history: list[dict],
@@ -1468,6 +1520,9 @@ def answer(
 
     main_answer = strip_noise_citations(main_answer)
     main_answer = dedupe_sources_sections(main_answer)
+    official_links_block = build_official_links_block(question, main_answer, matches)
+    if official_links_block and "### Официальные ссылки" not in main_answer:
+        main_answer = f"{main_answer}\n\n{official_links_block}"
 
     validation = validate_answer_content(main_answer, matches)
     search_note = ""
@@ -1532,96 +1587,518 @@ def answer(
     return result
 
 
-demo = gr.ChatInterface(
-    fn=answer,
-    additional_inputs=[
-        gr.Slider(
+CYBERPUNK_CSS = """
+:root {
+  --cp-bg: #070912;
+  --cp-surface: #0c1324;
+  --cp-text: #d8ecff;
+  --cp-neon-cyan: #00f0ff;
+  --cp-neon-pink: #ff2fd1;
+  --cp-neon-lime: #a8ff60;
+}
+
+body.cp-theme-cyberpunk, body.cp-theme-cyberpunk .gradio-container {
+  background:
+    radial-gradient(circle at 20% 15%, rgba(0, 240, 255, 0.14), transparent 45%),
+    radial-gradient(circle at 80% 5%, rgba(255, 47, 209, 0.14), transparent 40%),
+    linear-gradient(180deg, #05070f 0%, #0b1020 55%, #060910 100%);
+  color: var(--cp-text);
+}
+
+body.cp-theme-classic, body.cp-theme-classic .gradio-container {
+  background: #f4f6fb !important;
+  color: #1e2a3a !important;
+}
+
+.gradio-container .prose, .gradio-container .prose p, .gradio-container .prose li {
+  color: #cfe6ff !important;
+}
+
+.gradio-container .message, .gradio-container .panel, .gradio-container .block {
+  border-radius: 14px !important;
+}
+
+body.cp-theme-cyberpunk .gradio-container .message.bot {
+  background: linear-gradient(135deg, rgba(12, 19, 36, 0.95), rgba(7, 11, 22, 0.95)) !important;
+  border: 1px solid rgba(0, 240, 255, 0.35) !important;
+  box-shadow: 0 0 14px rgba(0, 240, 255, 0.16), inset 0 0 30px rgba(0, 240, 255, 0.04);
+}
+
+body.cp-theme-cyberpunk .gradio-container .message.user {
+  background: linear-gradient(135deg, rgba(26, 9, 35, 0.92), rgba(14, 7, 22, 0.92)) !important;
+  border: 1px solid rgba(255, 47, 209, 0.35) !important;
+  box-shadow: 0 0 14px rgba(255, 47, 209, 0.14), inset 0 0 24px rgba(255, 47, 209, 0.05);
+}
+
+body.cp-theme-classic .gradio-container .message.bot {
+  background: #ffffff !important;
+  border: 1px solid #dce6ff !important;
+  box-shadow: 0 4px 16px rgba(22, 42, 88, 0.08);
+}
+
+body.cp-theme-classic .gradio-container .message.user {
+  background: #edf2ff !important;
+  border: 1px solid #c9d8ff !important;
+  box-shadow: 0 4px 16px rgba(22, 42, 88, 0.08);
+}
+
+body.cp-theme-cyberpunk .gradio-container textarea, body.cp-theme-cyberpunk .gradio-container input {
+  background: rgba(7, 12, 24, 0.9) !important;
+  border: 1px solid rgba(0, 240, 255, 0.35) !important;
+  color: var(--cp-text) !important;
+  box-shadow: inset 0 0 10px rgba(0, 240, 255, 0.08);
+}
+
+body.cp-theme-classic .gradio-container textarea,
+body.cp-theme-classic .gradio-container input {
+  background: #ffffff !important;
+  border: 1px solid #cfdbff !important;
+  color: #162130 !important;
+}
+
+body.cp-theme-cyberpunk .gradio-container button.primary {
+  background: linear-gradient(90deg, rgba(0, 240, 255, 0.2), rgba(255, 47, 209, 0.22)) !important;
+  border: 1px solid rgba(0, 240, 255, 0.6) !important;
+  color: #ecfbff !important;
+  box-shadow: 0 0 14px rgba(0, 240, 255, 0.28);
+}
+
+body.cp-theme-classic .gradio-container button.primary {
+  background: linear-gradient(90deg, #4978ff, #6ea1ff) !important;
+  border: 1px solid #335de0 !important;
+  color: #fff !important;
+}
+
+body.cp-theme-cyberpunk .gradio-container h1,
+body.cp-theme-cyberpunk .gradio-container h2,
+body.cp-theme-cyberpunk .gradio-container h3 {
+  color: #e9f7ff !important;
+  text-shadow: 0 0 10px rgba(0, 240, 255, 0.42);
+}
+
+.cp-term {
+  display: inline-block;
+  padding: 0.06rem 0.36rem;
+  margin: 0 0.12rem;
+  border: 1px solid rgba(0, 240, 255, 0.55);
+  border-radius: 8px;
+  background: linear-gradient(90deg, rgba(0, 240, 255, 0.16), rgba(168, 255, 96, 0.14));
+  color: #eefffa;
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.45);
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.cp-term:hover {
+  border-color: rgba(255, 47, 209, 0.8);
+  box-shadow: 0 0 12px rgba(255, 47, 209, 0.35), 0 0 18px rgba(0, 240, 255, 0.28);
+  transform: translateY(-1px);
+}
+
+body.cp-theme-classic .cp-term {
+  border-color: #4c79ff;
+  background: linear-gradient(90deg, rgba(73, 120, 255, 0.14), rgba(83, 170, 255, 0.12));
+  color: #163067;
+  text-shadow: none;
+}
+
+@keyframes cpMessageIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+    filter: blur(1px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.cp-msg-animated {
+  animation: cpMessageIn 0.3s ease-out;
+}
+
+#cp-theme-toggle {
+  position: fixed;
+  top: 16px;
+  right: 18px;
+  z-index: 9999;
+  border: 1px solid rgba(0, 240, 255, 0.5);
+  border-radius: 999px;
+  background: rgba(6, 11, 22, 0.78);
+  color: #dff8ff;
+  font-size: 12px;
+  letter-spacing: .03em;
+  padding: 8px 12px;
+  cursor: pointer;
+  box-shadow: 0 0 12px rgba(0, 240, 255, 0.2);
+}
+
+body.cp-theme-classic #cp-theme-toggle {
+  background: #ffffff;
+  color: #1f345b;
+  border-color: #8eadff;
+  box-shadow: 0 6px 16px rgba(26, 49, 102, 0.15);
+}
+
+#cp-term-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 20px;
+  width: min(320px, 40vw);
+  max-height: 48vh;
+  overflow: auto;
+  z-index: 9998;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(0, 240, 255, 0.35);
+  background: linear-gradient(165deg, rgba(8, 14, 27, 0.92), rgba(12, 10, 26, 0.92));
+  box-shadow: 0 0 18px rgba(0, 240, 255, 0.16);
+  backdrop-filter: blur(6px);
+}
+
+body.cp-theme-classic #cp-term-panel {
+  border: 1px solid #c6d8ff;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 24px rgba(26, 49, 102, 0.14);
+}
+
+.cp-term-panel-title {
+  font-size: 12px;
+  margin-bottom: 8px;
+  opacity: 0.9;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+
+.cp-term-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cp-term-pill {
+  border: 1px solid rgba(0, 240, 255, 0.48);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  background: rgba(0, 240, 255, 0.12);
+  color: #dff9ff;
+}
+
+body.cp-theme-classic .cp-term-pill {
+  border-color: #8ea9ff;
+  background: #edf3ff;
+  color: #1f345b;
+}
+
+@media (max-width: 960px) {
+  #cp-term-panel {
+    width: calc(100vw - 20px);
+    right: 10px;
+    left: 10px;
+    bottom: 10px;
+  }
+}
+"""
+
+CYBERPUNK_JS = r"""
+() => {
+  if (window.__cpTermClickBound) return;
+  window.__cpTermClickBound = true;
+
+  const root = document.querySelector('.gradio-container') || document.body;
+  const THEME_KEY = 'egais_theme_mode';
+  const TERMS_KEY = 'egais_term_history';
+  const MAX_TERMS = 20;
+  const TERM_WORDS = [
+    'Федеральный закон', 'Постановление', 'Приказ',
+    'Росалкогольтабакконтроль', 'Росалкогольрегулирование',
+    'ЕГАИС', 'Госуслуги', 'лицензия', 'лицензируемой деятельности',
+    'заявление', 'госпошлина', 'переоформление', 'продление'
+  ];
+
+  const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const containsCpTerm = (node) => !!(node.parentElement && node.parentElement.closest('.cp-term'));
+  const inCodeBlock = (node) => !!(node.parentElement && node.parentElement.closest('code, pre'));
+
+  const createHighlightedFragment = (text) => {
+    const patterns = [
+      /(№\s*[0-9]{1,5}(?:-[0-9A-Za-zА-Яа-я]+)?)/gi,
+      /(стать[ьяи]\s+\d+(?:\.\d+)?)/gi,
+      /(пункт[а-я]*\s+\d+(?:\.\d+)?)/gi,
+      /(подпункт[а-я]*\s+\d+(?:\.\d+)?)/gi,
+    ];
+    const termsRe = new RegExp(`\\b(${TERM_WORDS.sort((a, b) => b.length - a.length).map(escapeRegExp).join('|')})\\b`, 'gi');
+    patterns.push(termsRe);
+
+    let html = text;
+    patterns.forEach((re) => {
+      html = html.replace(re, (m) => `<span class="cp-term" data-term="${m.replace(/"/g, '&quot;')}">${m}</span>`);
+    });
+    if (html === text) return null;
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html;
+    return tpl.content;
+  };
+
+  const sendTerm = (term) => {
+    const localRoot = document.querySelector('.gradio-container');
+    if (!localRoot) return;
+    const textarea = localRoot.querySelector('textarea');
+    if (!textarea) return;
+    textarea.focus();
+    textarea.value = term;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    const sendBtn = [...localRoot.querySelectorAll('button')].find((btn) => {
+      const label = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.textContent || '')).toLowerCase();
+      return /submit|send|отправ/.test(label);
+    });
+    if (sendBtn) setTimeout(() => sendBtn.click(), 50);
+  };
+
+  const highlightTermsInMessages = () => {
+    const messageBodies = document.querySelectorAll('.gradio-container .message .prose, .gradio-container .message .message-body');
+    messageBodies.forEach((msg) => {
+      const walker = document.createTreeWalker(msg, NodeFilter.SHOW_TEXT);
+      const targets = [];
+      let n;
+      while ((n = walker.nextNode())) {
+        if (!n.nodeValue || !n.nodeValue.trim()) continue;
+        if (containsCpTerm(n) || inCodeBlock(n)) continue;
+        targets.push(n);
+      }
+      targets.forEach((textNode) => {
+        const frag = createHighlightedFragment(textNode.nodeValue);
+        if (frag) textNode.replaceWith(frag);
+      });
+    });
+  };
+
+  const getTerms = () => {
+    try {
+      const data = JSON.parse(localStorage.getItem(TERMS_KEY) || '[]');
+      return Array.isArray(data) ? data : [];
+    } catch (_) {
+      return [];
+    }
+  };
+
+  const saveTerms = (terms) => {
+    localStorage.setItem(TERMS_KEY, JSON.stringify(terms.slice(0, MAX_TERMS)));
+  };
+
+  const renderTermPanel = () => {
+    let panel = document.getElementById('cp-term-panel');
+    if (!panel) {
+      panel = document.createElement('aside');
+      panel.id = 'cp-term-panel';
+      panel.innerHTML = '<div class="cp-term-panel-title">Term Matrix</div><div class="cp-term-list"></div>';
+      document.body.appendChild(panel);
+    }
+    const list = panel.querySelector('.cp-term-list');
+    const terms = getTerms();
+    list.innerHTML = '';
+    if (!terms.length) {
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.7';
+      empty.style.fontSize = '12px';
+      empty.textContent = 'Кликните термин в чате, чтобы добавить сюда.';
+      list.appendChild(empty);
+      return;
+    }
+    terms.forEach((term) => {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'cp-term-pill';
+      el.textContent = term;
+      el.addEventListener('click', () => sendTerm(term));
+      list.appendChild(el);
+    });
+  };
+
+  const pushTerm = (term) => {
+    if (!term) return;
+    const current = getTerms().filter((x) => x.toLowerCase() !== term.toLowerCase());
+    current.unshift(term);
+    saveTerms(current);
+    renderTermPanel();
+  };
+
+  const applyTheme = (mode) => {
+    document.body.classList.remove('cp-theme-cyberpunk', 'cp-theme-classic');
+    document.body.classList.add(mode === 'classic' ? 'cp-theme-classic' : 'cp-theme-cyberpunk');
+    localStorage.setItem(THEME_KEY, mode);
+    const toggle = document.getElementById('cp-theme-toggle');
+    if (toggle) {
+      toggle.textContent = mode === 'classic' ? 'Theme: Classic' : 'Theme: Cyberpunk';
+    }
+  };
+
+  const ensureThemeToggle = () => {
+    let toggle = document.getElementById('cp-theme-toggle');
+    if (!toggle) {
+      toggle = document.createElement('button');
+      toggle.id = 'cp-theme-toggle';
+      toggle.type = 'button';
+      document.body.appendChild(toggle);
+      toggle.addEventListener('click', () => {
+        const isClassic = document.body.classList.contains('cp-theme-classic');
+        applyTheme(isClassic ? 'cyberpunk' : 'classic');
+      });
+    }
+    const saved = localStorage.getItem(THEME_KEY) || 'cyberpunk';
+    applyTheme(saved);
+  };
+
+  const animateNewMessages = () => {
+    const nodes = document.querySelectorAll('.gradio-container .message');
+    nodes.forEach((node) => {
+      if (node.dataset.cpAnimated) return;
+      node.dataset.cpAnimated = '1';
+      node.classList.add('cp-msg-animated');
+      setTimeout(() => node.classList.remove('cp-msg-animated'), 420);
+    });
+  };
+
+  const observer = new MutationObserver(() => {
+    animateNewMessages();
+    highlightTermsInMessages();
+  });
+  observer.observe(root, { childList: true, subtree: true });
+
+  document.addEventListener('click', (evt) => {
+    const chip = evt.target.closest('.cp-term');
+    if (!chip) return;
+    const term = (chip.dataset.term || chip.textContent || '').trim();
+    if (!term) return;
+    pushTerm(term);
+    sendTerm(term);
+  });
+
+  ensureThemeToggle();
+  renderTermPanel();
+  animateNewMessages();
+  highlightTermsInMessages();
+}
+"""
+
+with gr.Blocks() as demo:
+    with gr.Accordion("Настройки", open=False):
+        top_k_input = gr.Slider(
             minimum=1,
             maximum=12,
             value=6,
             step=1,
             label="Top-K (количество найденных фрагментов)",
-        ),
-        gr.Checkbox(
+        )
+        official_only_input = gr.Checkbox(
             value=True,
             label="Только официальные НПА (рекомендуется)",
-        ),
-        gr.Checkbox(
+        )
+        embeddings_rerank_input = gr.Checkbox(
             value=False,
             label="Embeddings re-rank (гибридный retrieval)",
-        ),
-        gr.Slider(
+        )
+        embeddings_top_n_input = gr.Slider(
             minimum=10,
             maximum=80,
             value=40,
             step=1,
             label="Embeddings re-rank top-N кандидатов",
-        ),
-        gr.Checkbox(
+        )
+        use_llm_input = gr.Checkbox(
             value=True,
             label="LLM-режим",
-        ),
-        gr.Radio(
+        )
+        llm_backend_input = gr.Radio(
             choices=["ollama", "yandex_openai", "local_lora"],
             value="yandex_openai",
             label="LLM backend",
-        ),
-        gr.Textbox(
+        )
+        ollama_model_input = gr.Textbox(
             value=DEFAULT_OLLAMA_MODEL,
             label="Модель Ollama",
             placeholder="например: qwen2.5:0.5b",
-        ),
-        gr.Textbox(
+        )
+        lora_base_model_input = gr.Textbox(
             value=DEFAULT_LORA_BASE_MODEL,
             label="Local LoRA base model",
             placeholder="например: Qwen/Qwen2.5-1.5B-Instruct",
-        ),
-        gr.Textbox(
+        )
+        lora_adapter_path_input = gr.Textbox(
             value=DEFAULT_LORA_ADAPTER_PATH,
             label="Local LoRA adapter path",
             placeholder="/path/to/adapter",
-        ),
-        gr.Textbox(
+        )
+        yandex_api_key_input = gr.Textbox(
             value=DEFAULT_YANDEX_API_KEY,
             type="password",
             label="Yandex Cloud API key",
             placeholder="AQV...",
-        ),
-        gr.Textbox(
+        )
+        yandex_folder_input = gr.Textbox(
             value=DEFAULT_YANDEX_FOLDER,
             label="Yandex Cloud folder",
             placeholder="b1g...",
-        ),
-        gr.Textbox(
+        )
+        yandex_model_input = gr.Textbox(
             value=DEFAULT_YANDEX_MODEL,
             label="Yandex Cloud model",
             placeholder="deepseek-v32/latest",
-        ),
-        gr.Textbox(
+        )
+        yandex_embedding_model_input = gr.Textbox(
             value=DEFAULT_YANDEX_EMBEDDING_MODEL,
             label="Yandex embedding model",
             placeholder="text-search-query/latest",
-        ),
-        gr.Checkbox(
+        )
+        enable_logging_input = gr.Checkbox(
             value=False,
             label="Логирование в файл",
-        ),
-        gr.Checkbox(
+        )
+        show_reasoning_input = gr.Checkbox(
             value=False,
             label="Показывать рассуждение модели",
-        ),
-        gr.Checkbox(
+        )
+        multi_step_input = gr.Checkbox(
             value=False,
             label="Многошаговый retrieval (модель может запросить уточняющий поиск)",
+        )
+
+    gr.ChatInterface(
+        fn=answer,
+        additional_inputs=[
+            top_k_input,
+            official_only_input,
+            embeddings_rerank_input,
+            embeddings_top_n_input,
+            use_llm_input,
+            llm_backend_input,
+            ollama_model_input,
+            lora_base_model_input,
+            lora_adapter_path_input,
+            yandex_api_key_input,
+            yandex_folder_input,
+            yandex_model_input,
+            yandex_embedding_model_input,
+            enable_logging_input,
+            show_reasoning_input,
+            multi_step_input,
+        ],
+        title="EGAIS Normatives Assistant (локально)",
+        description=(
+            "Локальный поиск по нормативным документам ЕГАИС с юридическим шаблоном. "
+            "LLM: Ollama или Yandex Cloud (OpenAI-compatible API)."
         ),
-    ],
-    title="EGAIS Normatives Assistant (локально)",
-    description=(
-        "Локальный поиск по нормативным документам ЕГАИС с юридическим шаблоном. "
-        "LLM: Ollama или Yandex Cloud (OpenAI-compatible API)."
-    ),
-)
+    )
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        css=CYBERPUNK_CSS,
+        js=CYBERPUNK_JS,
+    )
