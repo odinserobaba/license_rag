@@ -6,6 +6,10 @@
 - офлайн лексический индекс (TF-IDF),
 - локальный веб-чат на Gradio.
 
+Подробная разбитая документация:
+
+- `docs/readme_parts/00_INDEX.md`
+
 ## Быстрый запуск (5 минут)
 
 ### Вариант A: одной командой (рекомендуется)
@@ -69,8 +73,12 @@ python3 scripts/build_index.py --chunks-jsonl processed/chunks.jsonl --output pr
 ## Что умеет текущая версия
 
 - Находит релевантные фрагменты по вопросу.
-- Возвращает источники (тип документа, номер, исходный файл).
+- Возвращает источники по метаданным документа (без имен файлов).
 - Работает полностью локально.
+- Поддерживает гибридный retrieval:
+  - этап 1: TF-IDF поиск по всему индексу,
+  - этап 2 (опционально): embeddings re-rank top-N кандидатов через Yandex Cloud API
+    с кэшированием в `processed/embedding_cache.json`.
 
 ## Две версии LLM-оценки
 
@@ -96,6 +104,53 @@ python3 scripts/llm_eval_local.py \
 
 Требуется запущенный локальный Ollama на `http://127.0.0.1:11434`.
 
+## Embeddings re-rank (гибридный retrieval)
+
+В UI доступны поля:
+- `Embeddings re-rank (гибридный retrieval)` — включает второй этап ранжирования.
+- `Embeddings re-rank top-N кандидатов` — сколько TF-IDF кандидатов отправлять на re-rank.
+- `Yandex embedding model` — модель эмбеддингов (по умолчанию `text-search-query/latest`).
+
+Поведение:
+- если embeddings недоступны (нет ключа/модель не отвечает), система автоматически
+  откатывается на TF-IDF и продолжает работать;
+- вычисленные вектора кэшируются в `processed/embedding_cache.json`.
+
+## LoRA / QLoRA workflow
+
+### 1) Собрать датасет из истории диалогов
+
+```bash
+python3 scripts/build_lora_dataset.py \
+  --input processed/qa_history.jsonl \
+  --out-train data/lora/train.jsonl \
+  --out-eval data/lora/eval.jsonl \
+  --eval-ratio 0.1
+```
+
+### 2) Обучить адаптер в Colab (T4)
+
+- Ноутбук: `notebooks/lora_qlora_colab.ipynb`
+- В Colab загрузите/подмонтируйте:
+  - `data/lora/train.jsonl`
+  - `data/lora/eval.jsonl`
+- На выходе получите папку адаптера LoRA.
+
+### 3) Локальный инференс адаптера
+
+```bash
+python3 scripts/lora_infer_local.py \
+  --base-model Qwen/Qwen2.5-1.5B-Instruct \
+  --adapter-path /path/to/adapter \
+  --question "какие документы нужны для перевозки этилового спирта"
+```
+
+Зависимости для LoRA/PEFT вынесены отдельно:
+
+```bash
+pip install -r requirements-lora.txt
+```
+
 ## Структура проекта
 
 ```text
@@ -106,13 +161,17 @@ processed/
   chunks.jsonl           # чанки для retrieval
   lexical_index.json     # офлайн индекс
 scripts/
+  build_lora_dataset.py
   rename_all_docs.py
   rename_unknown_docs.py
   prepare_corpus.py
   prepare_doc_files.py
   chunk_corpus.py
   build_index.py
+  lora_infer_local.py
   test_retrieval.py
+notebooks/
+  lora_qlora_colab.ipynb
 app.py                   # локальный веб-интерфейс
 build.sh                 # полная сборка индекса
 run.sh                   # запуск приложения
@@ -126,6 +185,7 @@ python3 scripts/test_retrieval.py --index processed/lexical_index.json --top-k 6
 
 ## Важно
 
-- Это retrieval-only версия (без генеративной LLM).
-- Для учебной защиты это нормальный работающий baseline.
-- Следующий шаг: подключить LLM (локально) и формировать финальный ответ на основе топ-фрагментов.
+- Это учебный юридический ассистент; ответы нужно проверять по официальным источникам.
+- LoRA обучается в Colab, локально используется инференс адаптера.
+- Для слабых машин рекомендуется оставить базовый retrieval и включать embeddings re-rank
+  только для сложных запросов.

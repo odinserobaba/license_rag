@@ -132,7 +132,11 @@ def infer_topic_tags(text: str) -> list[str]:
 
 def detect_source_kind(path: Path, text: str) -> str:
     low_name = path.name.lower()
-    if low_name.startswith("guide_") or low_name.startswith("faq_"):
+    if (
+        low_name.startswith("guide_")
+        or low_name.startswith("faq_")
+        or low_name in {"license.txt", "licensing.txt"}
+    ):
         return "guide"
     if infer_doc_type(text):
         return "official"
@@ -174,6 +178,46 @@ def split_into_sections(text: str) -> list[tuple[str, str]]:
             normalized.append((title, sec_text))
 
     return normalized if len(normalized) >= 2 else [("Общие положения", text)]
+
+
+def split_license_txt(text: str) -> list[tuple[str, str]]:
+    """
+    Specialized splitter for license.txt:
+    keep list items inside their parent licensing section and split
+    only on high-signal headings.
+    """
+    lines = text.splitlines()
+    heading_re = re.compile(r"^\s*\d{1,2}\.\s+Для получения лицензии\b", re.IGNORECASE)
+    boundary_re = re.compile(
+        r"^\s*(Лицензирование .*|Прием заявлений и документов по лицензированию.*)\s*$",
+        re.IGNORECASE,
+    )
+
+    sections: list[tuple[str, list[str]]] = []
+    cur_title = "Общие положения по лицензированию"
+    cur_lines: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        is_boundary = bool(line and (heading_re.match(line) or boundary_re.match(line)))
+        if is_boundary:
+            if cur_lines:
+                sections.append((cur_title, cur_lines))
+            cur_title = line
+            cur_lines = []
+            continue
+        cur_lines.append(raw_line)
+
+    if cur_lines:
+        sections.append((cur_title, cur_lines))
+
+    normalized: list[tuple[str, str]] = []
+    for title, sec_lines in sections:
+        sec_text = clean_text("\n".join(sec_lines))
+        if len(sec_text) >= 240:
+            normalized.append((title, sec_text))
+
+    return normalized if len(normalized) >= 2 else [("Общие положения", clean_text(text))]
 
 
 def split_pdf_into_sections(path: Path) -> list[dict]:
@@ -323,7 +367,13 @@ def main() -> None:
             skipped.append(path.name)
             continue
 
-        sections = split_into_sections(text) if suffix in {".txt", ".md"} else [("Основной текст", text)]
+        if suffix in {".txt", ".md"}:
+            if path.name.lower() == "license.txt":
+                sections = split_license_txt(text)
+            else:
+                sections = split_into_sections(text)
+        else:
+            sections = [("Основной текст", text)]
         for sec_idx, (sec_title, sec_text) in enumerate(sections, 1):
             rec_id = f"{path.stem}_extra_s{sec_idx:03d}"
             txt_path = txt_dir / f"{rec_id}.txt"

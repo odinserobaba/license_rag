@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 CHUNK_SIZE=5000
-CHUNK_OVERLAP=320
+CHUNK_OVERLAP=1000
 
 echo "[1/7] Ensure virtual environment"
 if [[ ! -d ".venv" ]]; then

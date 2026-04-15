@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import hashlib
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,11 @@ DEFAULT_YANDEX_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "b1g80c8c8v3gh72ahsi7")
 DEFAULT_YANDEX_MODEL = os.getenv("YANDEX_CLOUD_MODEL", "deepseek-v32/latest")
 LOG_PATH = Path("processed/chat_logs.jsonl")
 QA_LOG_PATH = Path("processed/qa_history.jsonl")
+EMBEDDING_CACHE_PATH = Path("processed/embedding_cache.json")
+DEFAULT_YANDEX_EMBEDDING_MODEL = os.getenv(
+    "YANDEX_EMBEDDING_MODEL",
+    "text-search-query/latest",
+)
 
 # Коды видов лицензируемой деятельности (справочник guide_license_activity_codes.md)
 LICENSE_ACTIVITY_CODES: list[tuple[str, str]] = [
@@ -409,6 +415,81 @@ def build_documents_block_from_context(question: str, matches: list[tuple[float,
     )
 
 
+def build_transport_docs_vs_requirements_block(question: str, matches: list[tuple[float, dict]]) -> str:
+    if not is_transport_ethanol_query(question):
+        return ""
+
+    doc_items: list[str] = []
+    doc_seen = set()
+    requirements: list[str] = []
+    req_seen = set()
+
+    for _, row in matches:
+        text = row.get("text", "")
+        meta = row.get("metadata", {}) or {}
+        text_low = text.lower()
+        sec_title_low = (meta.get("section_title") or "").lower()
+
+        # Prefer explicit list from transport license section in license.txt.
+        if "для получения лицензии на перевозк" in sec_title_low:
+            for raw in text.splitlines():
+                line = raw.strip()
+                if re.match(r"^\d+\)\s+.+", line):
+                    clean = re.sub(r"\s+", " ", line)
+                    if clean not in doc_seen:
+                        doc_seen.add(clean)
+                        doc_items.append(clean)
+                if len(doc_items) >= 8:
+                    break
+
+        # Requirements are often described separately from submission docs.
+        if "требован" in text_low or "соответств" in text_low:
+            normalized = re.sub(r"\s+", " ", text).strip()
+            if normalized and normalized not in req_seen:
+                req_seen.add(normalized)
+                requirements.append(normalized[:260] + ("..." if len(normalized) > 260 else ""))
+
+    if not doc_items and not requirements:
+        return ""
+
+    docs_part = (
+        "\n".join(f"- {item}" for item in doc_items[:6])
+        if doc_items
+        else "- В текущем retrieval-контексте не найден явный нумерованный перечень документов именно для подачи заявления на перевозки."
+    )
+    req_part = (
+        "\n".join(f"- {item}" for item in requirements[:4])
+        if requirements
+        else "- В текущем retrieval-контексте отдельный блок лицензионных требований выражен частично."
+    )
+    return (
+        "### Разделение: документы для подачи vs требования к лицензиату\n"
+        "#### Документы, подаваемые заявителем\n"
+        f"{docs_part}\n\n"
+        "#### Требования к лицензиату (условия соответствия)\n"
+        f"{req_part}\n\n"
+        "Примечание: не смешивайте документы для подачи заявления с требованиями соответствия перевозчика."
+    )
+
+
+def ensure_questions_to_applicant_block(answer_text: str, question: str) -> str:
+    if "### Что нужно уточнить у заявителя" in answer_text:
+        return answer_text
+
+    base = [
+        "- Тип продукции: этиловый спирт или нефасованная спиртосодержащая продукция (>25%).",
+        "- Планируемый годовой объем перевозок (в дал/год).",
+        "- Наличие собственного/арендованного транспорта и его реквизиты.",
+    ]
+    if is_transport_ethanol_query(question):
+        base.append("- По какому адресу(ам) зарегистрированы транспортные средства и ПАК/оборудование учета.")
+    return (
+        f"{answer_text}\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        + "\n".join(base)
+    )
+
+
 def strip_noise_citations(text: str) -> str:
     # Remove markdown numeric links like ](29), keep normal URLs intact.
     text = re.sub(r"\]\(\d{1,4}\)", "]", text)
@@ -447,6 +528,7 @@ def dedupe_sources_sections(text: str) -> str:
     for i, line in enumerate(out):
         if line.strip() in {
             "### Раскрытие норм из контекста",
+            "### Разделение: документы для подачи vs требования к лицензиату",
             "### Рассуждение модели",
             "### Проверка источников",
         }:
@@ -515,6 +597,181 @@ def append_qa_log(record: dict) -> None:
     QA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with QA_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+_EMBEDDING_CACHE_MEM: dict[str, dict[str, list[float]]] | None = None
+_EMBEDDING_CACHE_DIRTY = False
+
+
+def _load_embedding_cache() -> dict[str, dict[str, list[float]]]:
+    global _EMBEDDING_CACHE_MEM
+    if _EMBEDDING_CACHE_MEM is not None:
+        return _EMBEDDING_CACHE_MEM
+    if not EMBEDDING_CACHE_PATH.exists():
+        _EMBEDDING_CACHE_MEM = {}
+        return _EMBEDDING_CACHE_MEM
+    try:
+        with EMBEDDING_CACHE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _EMBEDDING_CACHE_MEM = data
+        else:
+            _EMBEDDING_CACHE_MEM = {}
+    except Exception:
+        _EMBEDDING_CACHE_MEM = {}
+    return _EMBEDDING_CACHE_MEM
+
+
+def _flush_embedding_cache_if_dirty() -> None:
+    global _EMBEDDING_CACHE_DIRTY
+    if not _EMBEDDING_CACHE_DIRTY:
+        return
+    cache = _load_embedding_cache()
+    EMBEDDING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with EMBEDDING_CACHE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
+    _EMBEDDING_CACHE_DIRTY = False
+
+
+def _normalize_embedding_text(text: str, max_len: int = 3500) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return normalized[:max_len]
+
+
+def _embedding_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _yandex_full_model(folder: str, model: str) -> str:
+    if model.startswith("gpt://"):
+        return model
+    return f"gpt://{folder}/{model}"
+
+
+def _fetch_embedding_yandex(text: str, api_key: str, folder: str, model: str) -> tuple[list[float] | None, str]:
+    if openai is None:
+        return None, "[EMBEDDINGS недоступны] не установлен пакет openai."
+    if not api_key or not folder or not model:
+        return None, "[EMBEDDINGS недоступны] не заданы api_key/folder/model."
+    try:
+        client = openai.OpenAI(
+            api_key=api_key,
+            base_url=YANDEX_OPENAI_BASE_URL,
+            project=folder,
+        )
+        response = client.embeddings.create(
+            model=_yandex_full_model(folder, model),
+            input=[text],
+        )
+        vec = response.data[0].embedding if response and response.data else None
+        if not vec:
+            return None, "[EMBEDDINGS недоступны] пустой embedding-ответ."
+        return [float(x) for x in vec], ""
+    except Exception as e:  # noqa: BLE001
+        return None, f"[EMBEDDINGS недоступны] ошибка Yandex Cloud: {e}"
+
+
+def _get_or_create_embedding(
+    text: str,
+    *,
+    api_key: str,
+    folder: str,
+    model: str,
+) -> tuple[list[float] | None, bool, str]:
+    global _EMBEDDING_CACHE_DIRTY
+    normalized = _normalize_embedding_text(text)
+    if not normalized:
+        return None, False, ""
+
+    cache = _load_embedding_cache()
+    model_key = f"{folder}::{model}"
+    model_cache = cache.setdefault(model_key, {})
+    h = _embedding_hash(normalized)
+    if h in model_cache:
+        return model_cache[h], True, ""
+
+    vec, err = _fetch_embedding_yandex(normalized, api_key=api_key, folder=folder, model=model)
+    if vec is None:
+        return None, False, err
+    model_cache[h] = vec
+    _EMBEDDING_CACHE_DIRTY = True
+    return vec, False, ""
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+def rerank_with_embeddings(
+    question: str,
+    scored: list[tuple[float, dict]],
+    *,
+    api_key: str,
+    folder: str,
+    model: str,
+    top_n: int = 40,
+    emb_weight: float = 0.35,
+) -> tuple[list[tuple[float, dict]], dict]:
+    if not scored:
+        return scored, {"enabled": True, "used": False, "reason": "no_candidates"}
+
+    top_n = max(5, min(int(top_n), 120))
+    candidates = scored[:top_n]
+    rest = scored[top_n:]
+    q_vec, q_from_cache, q_err = _get_or_create_embedding(
+        question,
+        api_key=api_key,
+        folder=folder,
+        model=model,
+    )
+    if q_vec is None:
+        return scored, {"enabled": True, "used": False, "error": q_err}
+
+    best_lex = max((s for s, _ in candidates), default=1.0) or 1.0
+    reranked: list[tuple[float, dict]] = []
+    emb_hits = 0
+    cache_hits = 1 if q_from_cache else 0
+    for lex_score, row in candidates:
+        text = row.get("text", "")
+        d_vec, d_from_cache, d_err = _get_or_create_embedding(
+            text,
+            api_key=api_key,
+            folder=folder,
+            model=model,
+        )
+        if d_vec is None:
+            # keep lexical rank for failed embedding chunks
+            reranked.append((lex_score, row))
+            continue
+        cache_hits += 1 if d_from_cache else 0
+        emb_sim = _cosine_similarity(q_vec, d_vec)
+        lex_norm = max(0.0, lex_score / best_lex)
+        emb_norm = max(0.0, min(1.0, (emb_sim + 1.0) / 2.0))
+        blended = (1.0 - emb_weight) * lex_norm + emb_weight * emb_norm
+        final_score = blended * best_lex
+        reranked.append((final_score, row))
+        emb_hits += 1
+
+    reranked.sort(key=lambda x: x[0], reverse=True)
+    _flush_embedding_cache_if_dirty()
+    return reranked + rest, {
+        "enabled": True,
+        "used": emb_hits > 0,
+        "candidates": len(candidates),
+        "embedded": emb_hits,
+        "cache_hits": cache_hits,
+    }
 
 
 def generate_with_ollama(prompt: str, model: str, max_tokens: int = 500) -> dict:
@@ -949,12 +1206,15 @@ def answer(
     history: list[dict],
     top_k: int,
     official_only: bool,
+    use_embeddings_rerank: bool,
+    embeddings_top_n: int,
     use_llm: bool,
     llm_backend: str,
     llm_model: str,
     yandex_api_key: str,
     yandex_folder: str,
     yandex_model: str,
+    yandex_embedding_model: str,
     enable_logging: bool,
     show_reasoning: bool,
     multi_step_retrieval: bool,
@@ -970,6 +1230,16 @@ def answer(
         official_only=official_only,
         retrieval_text=retrieval_boost,
     )
+    embedding_diag: dict = {"enabled": bool(use_embeddings_rerank), "used": False}
+    if use_embeddings_rerank:
+        scored, embedding_diag = rerank_with_embeddings(
+            question,
+            scored,
+            api_key=(yandex_api_key or "").strip(),
+            folder=(yandex_folder or "").strip(),
+            model=(yandex_embedding_model or "").strip(),
+            top_n=embeddings_top_n,
+        )
     matches = select_diverse_matches(scored, top_k)
     if not matches:
         return (
@@ -1072,6 +1342,12 @@ def answer(
     if docs_block:
         main_answer = f"{main_answer}\n\n{docs_block}"
 
+    docs_vs_req_block = build_transport_docs_vs_requirements_block(question, matches)
+    if docs_vs_req_block:
+        main_answer = f"{main_answer}\n\n{docs_vs_req_block}"
+
+    main_answer = ensure_questions_to_applicant_block(main_answer, question)
+
     if show_reasoning:
         reasoning_text = llm_reasoning.strip() if llm_reasoning else "Рассуждение не предоставлено моделью."
         main_answer = (
@@ -1102,6 +1378,12 @@ def answer(
             + f"{reason_tail}\n\n"
         )
     result = f"{search_note}{main_answer}\n\n{validation}\n\n---\n{DISCLAIMER}"
+    if use_embeddings_rerank and embedding_diag.get("error"):
+        result = (
+            f"{result}\n\n"
+            "### Embeddings re-rank\n"
+            f"Отключен для этого запроса: {embedding_diag.get('error')}"
+        )
 
     qa_record = {
         "ts": datetime.utcnow().isoformat() + "Z",
@@ -1111,6 +1393,10 @@ def answer(
         "model": yandex_model if llm_backend == "yandex_openai" else model_name,
         "top_k": top_k,
         "official_only": official_only,
+        "use_embeddings_rerank": bool(use_embeddings_rerank),
+        "embeddings_top_n": int(embeddings_top_n),
+        "embedding_model": (yandex_embedding_model or "").strip(),
+        "embedding_diag": embedding_diag,
         "multi_step_retrieval": multi_step_retrieval,
     }
     append_qa_log(qa_record)
@@ -1125,6 +1411,10 @@ def answer(
             "official_only": official_only,
             "use_llm": use_llm,
             "multi_step_retrieval": multi_step_retrieval,
+            "use_embeddings_rerank": bool(use_embeddings_rerank),
+            "embeddings_top_n": int(embeddings_top_n),
+            "embedding_model": (yandex_embedding_model or "").strip(),
+            "embedding_diag": embedding_diag,
             "follow_up_searches": follow_up_trace,
             "prompt": prompt,
             "response_preview": main_answer[:800],
@@ -1132,16 +1422,6 @@ def answer(
             "validation": validation,
         }
         append_log(record)
-        debug_block = (
-            "\n\n---\n"
-            f"**DEBUG**\n"
-            f"- backend: `{record['backend']}`\n"
-            f"- model: `{record['model']}`\n"
-            f"- logging: `on`\n\n"
-            f"**Промпт, отправленный в LLM:**\n"
-            f"```text\n{prompt if prompt else '[LLM prompt не использовался]'}\n```"
-        )
-        result += debug_block
     return result
 
 
@@ -1158,6 +1438,17 @@ demo = gr.ChatInterface(
         gr.Checkbox(
             value=True,
             label="Только официальные НПА (рекомендуется)",
+        ),
+        gr.Checkbox(
+            value=False,
+            label="Embeddings re-rank (гибридный retrieval)",
+        ),
+        gr.Slider(
+            minimum=10,
+            maximum=80,
+            value=40,
+            step=1,
+            label="Embeddings re-rank top-N кандидатов",
         ),
         gr.Checkbox(
             value=True,
@@ -1189,9 +1480,14 @@ demo = gr.ChatInterface(
             label="Yandex Cloud model",
             placeholder="deepseek-v32/latest",
         ),
+        gr.Textbox(
+            value=DEFAULT_YANDEX_EMBEDDING_MODEL,
+            label="Yandex embedding model",
+            placeholder="text-search-query/latest",
+        ),
         gr.Checkbox(
             value=False,
-            label="Логирование + показать отправленный prompt",
+            label="Логирование в файл",
         ),
         gr.Checkbox(
             value=False,
