@@ -116,6 +116,21 @@ python3 scripts/llm_eval_local.py \
   откатывается на TF-IDF и продолжает работать;
 - вычисленные вектора кэшируются в `processed/embedding_cache.json`.
 
+A/B оценка retrieval:
+
+```bash
+python3 scripts/eval_retrieval_ab.py \
+  --questions data/test/eval_questions.jsonl \
+  --top-k 6 \
+  --official-only \
+  --embeddings-top-n 40 \
+  --yandex-api-key "$YANDEX_CLOUD_API_KEY" \
+  --yandex-folder "$YANDEX_CLOUD_FOLDER" \
+  --embedding-model text-search-query/latest \
+  --output-jsonl processed/eval_retrieval_ab.jsonl \
+  --output-summary processed/eval_retrieval_ab_summary.json
+```
+
 ## LoRA / QLoRA workflow
 
 ### 1) Собрать датасет из истории диалогов
@@ -145,6 +160,10 @@ python3 scripts/lora_infer_local.py \
   --question "какие документы нужны для перевозки этилового спирта"
 ```
 
+Для запуска через веб-приложение выберите backend `local_lora` и задайте:
+- `Local LoRA base model`
+- `Local LoRA adapter path`
+
 Зависимости для LoRA/PEFT вынесены отдельно:
 
 ```bash
@@ -169,6 +188,7 @@ scripts/
   chunk_corpus.py
   build_index.py
   lora_infer_local.py
+  eval_retrieval_ab.py
   test_retrieval.py
 notebooks/
   lora_qlora_colab.ipynb

@@ -68,6 +68,8 @@ DEFAULT_YANDEX_API_KEY = os.getenv(
 )
 DEFAULT_YANDEX_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "b1g80c8c8v3gh72ahsi7")
 DEFAULT_YANDEX_MODEL = os.getenv("YANDEX_CLOUD_MODEL", "deepseek-v32/latest")
+DEFAULT_LORA_BASE_MODEL = os.getenv("LOCAL_LORA_BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+DEFAULT_LORA_ADAPTER_PATH = os.getenv("LOCAL_LORA_ADAPTER_PATH", "")
 LOG_PATH = Path("processed/chat_logs.jsonl")
 QA_LOG_PATH = Path("processed/qa_history.jsonl")
 EMBEDDING_CACHE_PATH = Path("processed/embedding_cache.json")
@@ -643,9 +645,12 @@ def _embedding_hash(text: str) -> str:
 
 
 def _yandex_full_model(folder: str, model: str) -> str:
-    if model.startswith("gpt://"):
+    if model.startswith("emb://"):
         return model
-    return f"gpt://{folder}/{model}"
+    if model.startswith("gpt://"):
+        # Be tolerant to legacy config: convert chat schema to embedding schema.
+        return "emb://" + model[len("gpt://") :]
+    return f"emb://{folder}/{model}"
 
 
 def _fetch_embedding_yandex(text: str, api_key: str, folder: str, model: str) -> tuple[list[float] | None, str]:
@@ -662,6 +667,7 @@ def _fetch_embedding_yandex(text: str, api_key: str, folder: str, model: str) ->
         response = client.embeddings.create(
             model=_yandex_full_model(folder, model),
             input=[text],
+            encoding_format="float",
         )
         vec = response.data[0].embedding if response and response.data else None
         if not vec:
@@ -772,6 +778,92 @@ def rerank_with_embeddings(
         "embedded": emb_hits,
         "cache_hits": cache_hits,
     }
+
+
+_LORA_RUNTIME: dict | None = None
+
+
+def _load_local_lora_runtime(base_model: str, adapter_path: str) -> tuple[dict | None, str]:
+    global _LORA_RUNTIME
+    base_model = (base_model or "").strip()
+    adapter_path = (adapter_path or "").strip()
+    if not base_model:
+        return None, "[LLM недоступна] не задана base model для local_lora."
+    if not adapter_path:
+        return None, "[LLM недоступна] не задан путь к LoRA adapter."
+    if not Path(adapter_path).exists():
+        return None, f"[LLM недоступна] adapter path не найден: {adapter_path}"
+
+    cache_key = f"{base_model}::{adapter_path}"
+    if _LORA_RUNTIME and _LORA_RUNTIME.get("key") == cache_key:
+        return _LORA_RUNTIME, ""
+
+    try:
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except Exception as e:  # noqa: BLE001
+        return None, (
+            "[LLM недоступна] local_lora требует зависимости: "
+            "pip install -r requirements-lora.txt. "
+            f"Ошибка импорта: {e}"
+        )
+
+    try:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(base, adapter_path)
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        _LORA_RUNTIME = {
+            "key": cache_key,
+            "model": model,
+            "tokenizer": tokenizer,
+            "torch": torch,
+        }
+        return _LORA_RUNTIME, ""
+    except Exception as e:  # noqa: BLE001
+        return None, f"[LLM недоступна] ошибка инициализации local_lora: {e}"
+
+
+def generate_with_local_lora(
+    prompt: str,
+    base_model: str,
+    adapter_path: str,
+    max_tokens: int = 800,
+) -> dict:
+    runtime, err = _load_local_lora_runtime(base_model, adapter_path)
+    if runtime is None:
+        return {"text": "", "reasoning": "", "error": err}
+
+    model = runtime["model"]
+    tokenizer = runtime["tokenizer"]
+    torch = runtime["torch"]
+
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max(128, min(int(max_tokens), 1600)),
+                do_sample=False,
+                temperature=0.1,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        gen_ids = output_ids[0][inputs["input_ids"].shape[1] :]
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        if not text:
+            return {"text": "", "reasoning": "", "error": "[LLM недоступна] local_lora вернула пустой ответ."}
+        return {"text": text, "reasoning": "", "error": ""}
+    except Exception as e:  # noqa: BLE001
+        return {"text": "", "reasoning": "", "error": f"[LLM недоступна] ошибка local_lora: {e}"}
 
 
 def generate_with_ollama(prompt: str, model: str, max_tokens: int = 500) -> dict:
@@ -1211,6 +1303,8 @@ def answer(
     use_llm: bool,
     llm_backend: str,
     llm_model: str,
+    lora_base_model: str,
+    lora_adapter_path: str,
     yandex_api_key: str,
     yandex_folder: str,
     yandex_model: str,
@@ -1314,6 +1408,13 @@ def answer(
                 folder=yandex_folder,
                 model=yandex_model,
             )
+        elif llm_backend == "local_lora":
+            llm_result = generate_with_local_lora(
+                prompt=prompt,
+                base_model=lora_base_model,
+                adapter_path=lora_adapter_path,
+                max_tokens=1000,
+            )
         else:
             llm_result = generate_with_ollama(prompt, model_name)
         llm_answer = llm_result.get("text", "")
@@ -1385,12 +1486,18 @@ def answer(
             f"Отключен для этого запроса: {embedding_diag.get('error')}"
         )
 
+    selected_model_name = (
+        yandex_model
+        if llm_backend == "yandex_openai"
+        else (f"{(lora_base_model or '').strip()} + adapter" if llm_backend == "local_lora" else model_name)
+    )
+
     qa_record = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "question": question,
         "answer": result,
         "backend": llm_backend if use_llm else "template_only",
-        "model": yandex_model if llm_backend == "yandex_openai" else model_name,
+        "model": selected_model_name,
         "top_k": top_k,
         "official_only": official_only,
         "use_embeddings_rerank": bool(use_embeddings_rerank),
@@ -1406,7 +1513,7 @@ def answer(
             "ts": datetime.utcnow().isoformat() + "Z",
             "question": question,
             "backend": llm_backend if use_llm else "template_only",
-            "model": yandex_model if llm_backend == "yandex_openai" else model_name,
+            "model": selected_model_name,
             "top_k": top_k,
             "official_only": official_only,
             "use_llm": use_llm,
@@ -1455,7 +1562,7 @@ demo = gr.ChatInterface(
             label="LLM-режим",
         ),
         gr.Radio(
-            choices=["ollama", "yandex_openai"],
+            choices=["ollama", "yandex_openai", "local_lora"],
             value="yandex_openai",
             label="LLM backend",
         ),
@@ -1463,6 +1570,16 @@ demo = gr.ChatInterface(
             value=DEFAULT_OLLAMA_MODEL,
             label="Модель Ollama",
             placeholder="например: qwen2.5:0.5b",
+        ),
+        gr.Textbox(
+            value=DEFAULT_LORA_BASE_MODEL,
+            label="Local LoRA base model",
+            placeholder="например: Qwen/Qwen2.5-1.5B-Instruct",
+        ),
+        gr.Textbox(
+            value=DEFAULT_LORA_ADAPTER_PATH,
+            label="Local LoRA adapter path",
+            placeholder="/path/to/adapter",
         ),
         gr.Textbox(
             value=DEFAULT_YANDEX_API_KEY,
