@@ -8,6 +8,22 @@ from html import unescape
 from pathlib import Path
 
 
+def build_doc_citation(meta: dict) -> str:
+    doc_type = (meta.get("doc_type") or "Документ").strip()
+    number = meta.get("doc_number_text") or meta.get("doc_number_file")
+    date = meta.get("doc_date_file")
+    title = meta.get("title_guess")
+
+    parts = [doc_type]
+    if number:
+        parts.append(f"№{number}")
+    if date:
+        parts.append(f"от {date}")
+    if title:
+        parts.append(f"— {title}")
+    return " ".join(parts)
+
+
 def extract_html_from_mhtml(raw_bytes: bytes) -> str:
     msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
     if msg.is_multipart():
@@ -83,6 +99,16 @@ def extract_metadata(file_name: str, text: str) -> dict:
         "doc_date_file": doc_date_file,
         "doc_number_text": doc_number_text,
         "title_guess": title,
+        "doc_title": title,
+        "doc_citation": build_doc_citation(
+            {
+                "doc_type": doc_type,
+                "doc_number_file": doc_number_file,
+                "doc_date_file": doc_date_file,
+                "doc_number_text": doc_number_text,
+                "title_guess": title,
+            }
+        ),
     }
 
 

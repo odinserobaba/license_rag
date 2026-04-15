@@ -21,11 +21,12 @@ chmod +x build.sh run.sh
 - установит зависимости,
 - обработает `doc/*.rtf`,
 - дополнительно обработает `doc/*.doc` и `doc/*.docx` (если есть),
+- дополнительно обработает `doc/*.doc`, `doc/*.docx`, `doc/*.txt`, `doc/*.md`, `doc/*.pdf` (если есть),
 - соберет `processed/lexical_index.json`.
 
 Текущие параметры retrieval:
-- `chunk_size=1700`
-- `overlap=260`
+- `chunk_size=2200`
+- `overlap=320`
 - `top_k` в интерфейсе по умолчанию `6` (регулируется слайдером).
 - включен режим `Только официальные НПА` (по умолчанию ON).
 
@@ -52,7 +53,7 @@ with merged.open("w", encoding="utf-8") as out:
         out.write(extra.read_text(encoding="utf-8"))
 print("merged:", merged)
 PY
-python3 scripts/chunk_corpus.py --input-jsonl processed/cleaned_docs.jsonl --output-jsonl processed/chunks.jsonl --chunk-size 1700 --overlap 260
+python3 scripts/chunk_corpus.py --input-jsonl processed/cleaned_docs.jsonl --output-jsonl processed/chunks.jsonl --chunk-size 2200 --overlap 320
 python3 scripts/build_index.py --chunks-jsonl processed/chunks.jsonl --output processed/lexical_index.json
 ```
 
