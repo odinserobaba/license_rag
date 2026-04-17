@@ -13,10 +13,47 @@ ARTICLE_HEADING_RE = re.compile(r"^Статья\s+(\d+(?:\.\d+)?)\.?\s*(.*)$", r
 CHAPTER_HEADING_RE = re.compile(r"^(Глава\s+\S+(?:\s+.+)?)$", re.IGNORECASE)
 SUBPOINT_LINE_RE = re.compile(r"^\s*((?:\d+(?:\.\d+)?[.)])|(?:[а-я]\)))\s*", re.IGNORECASE)
 ARTICLE_REF_RE = re.compile(r"стать[ьяеи]\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?;:])\s+")
 
 
 def split_to_paragraphs(text: str) -> list[str]:
-    parts = [p.strip() for p in text.split("\n") if p.strip()]
+    lines = text.splitlines()
+    parts: list[str] = []
+    cur: list[str] = []
+
+    def flush() -> None:
+        if not cur:
+            return
+        block = re.sub(r"\s+", " ", " ".join(cur)).strip()
+        if block:
+            parts.append(block)
+        cur.clear()
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            flush()
+            continue
+
+        is_heading = bool(
+            BOUNDARY_RE.match(line)
+            or ARTICLE_HEADING_RE.match(line)
+            or CHAPTER_HEADING_RE.match(line)
+        )
+
+        # Keep legal headings and list-item starters as separate semantic units.
+        if is_heading and cur:
+            flush()
+        if is_heading:
+            parts.append(line)
+            continue
+
+        cur.append(line)
+    flush()
+
+    if len(parts) < 2:
+        # Fallback for noisy OCR-like texts.
+        return [p.strip() for p in text.split("\n") if p.strip()]
     return parts
 
 
@@ -99,25 +136,66 @@ def extract_cited_article_refs(text: str, limit: int = 25) -> list[str]:
 
 
 def chunk_paragraphs(paragraphs: list[str], chunk_size: int, overlap: int) -> list[str]:
+    def split_long_paragraph(p: str) -> list[str]:
+        if len(p) <= chunk_size:
+            return [p]
+        sentences = SENTENCE_SPLIT_RE.split(p)
+        if len(sentences) <= 1:
+            return [p[i : i + chunk_size] for i in range(0, len(p), chunk_size)]
+
+        out: list[str] = []
+        cur_sent: list[str] = []
+        cur_len = 0
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if cur_sent and cur_len + len(s) + 1 > chunk_size:
+                out.append(" ".join(cur_sent).strip())
+                cur_sent = [s]
+                cur_len = len(s)
+            else:
+                cur_sent.append(s)
+                cur_len += len(s) + 1
+        if cur_sent:
+            out.append(" ".join(cur_sent).strip())
+        return out or [p]
+
+    def overlap_tail(prev: list[str], overlap_chars: int) -> list[str]:
+        if overlap_chars <= 0 or not prev:
+            return []
+        acc: list[str] = []
+        total = 0
+        for para in reversed(prev):
+            acc.insert(0, para)
+            total += len(para) + 1
+            if total >= overlap_chars:
+                break
+        return acc
+
+    normalized: list[str] = []
+    for p in paragraphs:
+        normalized.extend(split_long_paragraph(p))
+
     chunks: list[str] = []
     cur: list[str] = []
     cur_len = 0
+    min_chunk = max(300, chunk_size // 3)
 
-    for p in paragraphs:
+    for p in normalized:
         p_len = len(p)
         # Start new chunk on explicit legal boundary when current chunk is non-trivial
-        if cur and BOUNDARY_RE.match(p) and cur_len >= max(250, chunk_size // 3):
+        if cur and BOUNDARY_RE.match(p) and cur_len >= min_chunk:
             chunks.append("\n".join(cur).strip())
-            # overlap by tail characters from previous chunk
-            tail = chunks[-1][-overlap:] if overlap > 0 else ""
-            cur = [tail, p] if tail else [p]
+            tail = overlap_tail(cur, overlap)
+            cur = tail + [p]
             cur_len = len("\n".join(cur))
             continue
 
         if cur_len + p_len + 1 > chunk_size and cur:
             chunks.append("\n".join(cur).strip())
-            tail = chunks[-1][-overlap:] if overlap > 0 else ""
-            cur = [tail, p] if tail else [p]
+            tail = overlap_tail(cur, overlap)
+            cur = tail + [p]
             cur_len = len("\n".join(cur))
         else:
             cur.append(p)
