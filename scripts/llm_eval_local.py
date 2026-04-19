@@ -54,15 +54,22 @@ def score_query(query: str, index: dict) -> list[tuple[float, dict]]:
     return scored
 
 
-def build_prompt(question: str, matches: list[tuple[float, dict]]) -> str:
+def build_prompt(
+    question: str,
+    matches: list[tuple[float, dict]],
+    max_chunk_chars: int | None = 800,
+) -> str:
     context_blocks = []
     for i, (score, row) in enumerate(matches, 1):
         meta = row.get("metadata", {})
         doc_type = meta.get("doc_type", "Документ")
         doc_no = meta.get("doc_number_file") or meta.get("doc_number_text") or "n/a"
         source = meta.get("source_file", "n/a")
+        body = row.get("text") or ""
+        if max_chunk_chars is not None and max_chunk_chars > 0:
+            body = body[:max_chunk_chars]
         context_blocks.append(
-            f"[{i}] {doc_type} №{doc_no} ({source})\n{row['text'][:1200]}"
+            f"[{i}] {doc_type} №{doc_no} ({source})\n{body}"
         )
     context = "\n\n".join(context_blocks)
     return (
@@ -77,12 +84,40 @@ def build_prompt(question: str, matches: list[tuple[float, dict]]) -> str:
     )
 
 
+def select_matches(
+    ranked: list[tuple[float, dict]],
+    *,
+    top_k: int,
+    max_chunks_cap: int,
+    prompt_char_budget: int,
+) -> list[tuple[float, dict]]:
+    """Отбор чанков по рангу TF-IDF: бюджет символов и/или top_k / max_chunks_cap."""
+    if prompt_char_budget > 0:
+        out: list[tuple[float, dict]] = []
+        used = 0
+        overhead = 200
+        for pair in ranked:
+            if len(out) >= max_chunks_cap:
+                break
+            row = pair[1]
+            t = len(row.get("text") or "")
+            need = t + overhead
+            if used + need > prompt_char_budget and out:
+                break
+            out.append(pair)
+            used += need
+        return out
+    if top_k <= 0:
+        return ranked[:max_chunks_cap]
+    return ranked[:top_k]
+
+
 def ollama_generate(model: str, prompt: str, url: str) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.1},
+        "options": {"temperature": 0.1, "num_predict": 768},
     }
     req = urllib.request.Request(
         url=url,
@@ -91,7 +126,7 @@ def ollama_generate(model: str, prompt: str, url: str) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=3600) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("response", "").strip()
     except urllib.error.URLError as e:
