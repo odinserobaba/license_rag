@@ -9,6 +9,8 @@
 - Если цель дообучение роли ассистента: переходите к `05_LORA_WORKFLOW_END_TO_END.md`.
 - Если цель эксплуатация и стабильность: `06_OPERATION_MONITORING_TROUBLESHOOTING.md`.
 - Если цель довести проект до итоговой демонстрации: `07_IMPLEMENTATION_PLAN_TURNKEY.md`.
+- Если цель перенести и запустить на Windows + GGUF: `08_WINDOWS_DEPLOYMENT_QWEN3_GGUF_LORA.md`.
+- Если нужна визуальная схема архитектуры и шагов: `09_ARCHITECTURE_AND_WORKFLOW_SCHEMES.md`.
 
 ## Состав документации
 
@@ -33,16 +35,19 @@
 7. `07_IMPLEMENTATION_PLAN_TURNKEY.md`  
    Пошаговый план "под ключ": что и в каком порядке делать, чтобы получить финальную версию для защиты.
 
-8. `08_ANALYTICAL_ETHANOL_REGULATORY_FRAMEWORK_2026_DRAFT.md`  
-   Черновик системного обзора регулирования оборота этилового спирта (вне RAG-корпуса; требует сверки с официальными НПА перед использованием как источник фактов).
+8. `08_WINDOWS_DEPLOYMENT_QWEN3_GGUF_LORA.md`  
+   Практическое руководство по переносу проекта на Windows, запуску через Ollama + Qwen3-8B-GGUF и интеграции LoRA.
 
-9. `08_ANALYTICAL_ETHANOL_REGULATORY_FRAMEWORK_2026_VERIFICATION.md`  
-   Отчёт проверки черновика (п. 8): какие утверждения неверны и куда смотреть за официальными текстами.
+9. `09_ARCHITECTURE_AND_WORKFLOW_SCHEMES.md`  
+   Наглядные схемы (mermaid): ingestion, retrieval, generation, валидация и цикл дообучения LoRA.
 
 ## Основные файлы проекта
 
 - `build.sh` — полный rebuild индекса и корпуса.
 - `run.sh` — запуск веб-приложения Gradio.
+- `build_windows.ps1` — сборка корпуса/индекса на Windows.
+- `run_windows.ps1` — запуск веб-приложения на Windows.
+- `import_qwen3_8b_gguf_ollama.ps1` — импорт локального GGUF в Ollama как модель для тестирования.
 - `app.py` — retrieval + LLM + форматирование ответа.
 - `scripts/prepare_corpus.py` — подготовка RTF/MHTML-корпуса.
 - `scripts/prepare_doc_files.py` — подготовка DOC/DOCX/TXT/MD/PDF и спец-обработка `license.txt`.

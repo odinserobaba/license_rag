@@ -1,0 +1,46 @@
+# Final Release Package (YandexGPT-5-lite)
+
+Эта папка содержит финальную конфигурацию и чек-лист запуска production-baseline:
+- LLM backend: `yandex_openai`
+- модель: `yandexgpt-5-lite/latest`
+- retrieval: `top_k=12`, `official_only=ON`, `embeddings re-rank=ON`, `top_n=80`, `multi-step=ON`
+
+## Содержимое
+
+- `FINAL_SCHEMA_YANDEXGPT5LITE.md` — схема работы финального контура.
+- `CORPUS_RETRIEVAL_PIPELINE.md` — отдельно про сбор корпуса и retrieval pipeline.
+- `FINAL_VERSION_MANIFEST.md` — список файлов репозитория, относящихся к финальной версии.
+- `.env.final.example` — шаблон переменных окружения.
+- `run_final_web.sh` — запуск веба с baseline-параметрами.
+
+## Быстрый запуск
+
+1) Подготовьте `.env` на основе `.env.final.example`:
+
+```bash
+cp release/.env.final.example .env.final
+```
+
+2) Заполните секреты в `.env.final` (минимум `YANDEX_CLOUD_API_KEY`).
+
+3) Запустите:
+
+```bash
+chmod +x release/run_final_web.sh
+./release/run_final_web.sh
+```
+
+Веб-интерфейс: <http://127.0.0.1:7860>
+
+## Оценка качества
+
+Основной regression-run (20 вопросов):
+
+```bash
+./.venv/bin/python scripts/eval_yandex_suite.py \
+  --llm-backend yandex_openai \
+  --questions data/test/eval_questions.jsonl \
+  --out-jsonl processed/yandexgpt5lite_eval_20_final.jsonl \
+  --out-md processed/yandexgpt5lite_eval_20_final_report.md \
+  --out-qa processed/yandexgpt5lite_eval_20_final_qa.md
+```

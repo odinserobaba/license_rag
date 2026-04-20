@@ -124,3 +124,60 @@ def test_enforce_strict_sources_rebuilds_from_matches():
     assert "- Левый источник" not in rebuilt
     assert "### Источники" in rebuilt
     assert "171-ФЗ" in rebuilt
+
+
+def test_applicant_clarification_retail_avoids_transport_checklist():
+    q = "Кто выдает лицензию на розничную продажу алкоголя?"
+    bullets = app.applicant_clarification_bullets(q)
+    joined = " ".join(bullets).lower()
+    assert "дал/год" not in joined
+    assert "нефасованная спиртосодержащая" not in joined
+
+
+def test_applicant_clarification_transport_keeps_ethanol_context():
+    q = "Какие документы нужны для лицензии на перевозки этилового спирта?"
+    bullets = app.applicant_clarification_bullets(q)
+    joined = " ".join(bullets).lower()
+    assert "этилов" in joined or "спирт" in joined
+    assert "перевоз" in joined or "дал" in joined
+
+
+def test_llm_unavailability_bannermentions_fallback():
+    b = app.llm_availability_user_banner("[LLM недоступна] Error code: 503")
+    assert "503" in b or "5xx" in b
+    assert "RAG" in b or "индекс" in b.lower()
+
+
+def test_build_requisites_review_block_when_unverified_present():
+    block = app.build_requisites_review_block(2)
+    assert "Контроль реквизитов" in block
+    assert "проверить реквизит" in block
+
+
+def test_dedupe_sources_sections_merges_same_law_variants():
+    text = (
+        "### Краткий ответ\nok\n\n"
+        "### Источники\n"
+        "- Федеральный закон № 171-ФЗ\n"
+        "- 171-фз\n"
+        "- [Федеральный закон №171-ФЗ](http://example.com)\n"
+    )
+    out = app.dedupe_sources_sections(text)
+    assert out.count("### Источники") == 1
+    # Only one bullet for the 171-FZ family should remain.
+    assert out.count("\n- ") == 1
+
+
+def test_sanitize_clarification_removes_transport_bullets_for_non_transport_question():
+    q = "Кто выдает лицензию на розничную продажу алкоголя?"
+    text = (
+        "### Краткий ответ\nok\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        "- Тип продукции: этиловый спирт или нефасованная спиртосодержащая продукция (>25%).\n"
+        "- Планируемый годовой объем перевозок (в дал/год).\n"
+        "- Субъект РФ и адрес объекта.\n"
+    )
+    out = app.sanitize_clarification_block_by_topic(text, q)
+    assert "дал/год" not in out.lower()
+    assert "нефасованная спиртосодержащая" not in out.lower()
+    assert "Субъект РФ и адрес объекта." in out

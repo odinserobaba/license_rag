@@ -9,6 +9,9 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.tmp
+*.bak
 
 # Project artifacts
 processed/
@@ -19,3 +22,7 @@ doc/rename_map*.tsv
 # Local models and heavy assets
 models/
 chroma_db/
+
+# Jupyter / pytest / local caches
+.ipynb_checkpoints/
+.pytest_cache/

@@ -4,7 +4,8 @@
 - подготовка корпуса из `doc/*.rtf` (MHTML внутри),
 - очистка и чанкинг,
 - офлайн лексический индекс (TF-IDF),
-- локальный веб-чат на Gradio.
+- локальный веб-чат на Gradio,
+- запуск и тестирование на Linux и Windows.
 
 Подробная разбитая документация:
 
@@ -12,7 +13,7 @@
 
 ## Быстрый запуск (5 минут)
 
-### Вариант A: одной командой (рекомендуется)
+### Вариант A (Linux/macOS): одной командой (рекомендуется)
 
 ```bash
 chmod +x build.sh run.sh
@@ -29,12 +30,12 @@ chmod +x build.sh run.sh
 - соберет `processed/lexical_index.json`.
 
 Текущие параметры retrieval:
-- `chunk_size=2200`
-- `overlap=320`
+- `chunk_size=3200`
+- `overlap=700`
 - `top_k` в интерфейсе по умолчанию `6` (регулируется слайдером).
 - включен режим `Только официальные НПА` (по умолчанию ON).
 
-### Вариант B: вручную по шагам
+### Вариант B (Linux/macOS): вручную по шагам
 
 ```bash
 python3 -m venv .venv
@@ -57,11 +58,11 @@ with merged.open("w", encoding="utf-8") as out:
         out.write(extra.read_text(encoding="utf-8"))
 print("merged:", merged)
 PY
-python3 scripts/chunk_corpus.py --input-jsonl processed/cleaned_docs.jsonl --output-jsonl processed/chunks.jsonl --chunk-size 2200 --overlap 320
+python3 scripts/chunk_corpus.py --input-jsonl processed/cleaned_docs.jsonl --output-jsonl processed/chunks.jsonl --chunk-size 3200 --overlap 700
 python3 scripts/build_index.py --chunks-jsonl processed/chunks.jsonl --output processed/lexical_index.json
 ```
 
-### Запуск веб-чата
+### Запуск веб-чата (Linux/macOS)
 
 ```bash
 ./run.sh
@@ -69,6 +70,34 @@ python3 scripts/build_index.py --chunks-jsonl processed/chunks.jsonl --output pr
 
 Откройте в браузере:
 - http://127.0.0.1:7860
+
+## Запуск на Windows (PowerShell)
+
+```powershell
+.\build_windows.ps1
+```
+
+После сборки:
+
+```powershell
+.\run_windows.ps1
+```
+
+### Тест на Qwen3-8B-GGUF (Ollama)
+
+1. Установите Ollama: <https://ollama.com/download>  
+2. Импортируйте GGUF:
+
+```powershell
+.\import_qwen3_8b_gguf_ollama.ps1 -GgufPath "D:\models\Qwen3-8B-Instruct.gguf" -ModelName "qwen3-8b-gguf"
+```
+
+3. Выберите модель для приложения:
+
+```powershell
+$env:OLLAMA_MODEL = "qwen3-8b-gguf"
+.\run_windows.ps1
+```
 
 ## Что умеет текущая версия
 
@@ -221,6 +250,9 @@ notebooks/
 app.py                   # локальный веб-интерфейс
 build.sh                 # полная сборка индекса
 run.sh                   # запуск приложения
+build_windows.ps1        # полная сборка на Windows
+run_windows.ps1          # запуск приложения на Windows
+import_qwen3_8b_gguf_ollama.ps1  # импорт GGUF в Ollama
 ```
 
 ## Smoke test retrieval
@@ -235,3 +267,10 @@ python3 scripts/test_retrieval.py --index processed/lexical_index.json --top-k 6
 - LoRA обучается в Colab, локально используется инференс адаптера.
 - Для слабых машин рекомендуется оставить базовый retrieval и включать embeddings re-rank
   только для сложных запросов.
+
+## Перед загрузкой на GitHub
+
+- Убедитесь, что в репозиторий не попадают локальные артефакты:
+  - `processed/`, `.venv/`, `models/`, кэши и временные файлы.
+- Проверьте `.gitignore` (в проекте уже настроен для типовых локальных артефактов).
+- Для воспроизводимости достаточно хранить исходники, `doc/`, `data/`, `docs/` и скрипты сборки/запуска.
