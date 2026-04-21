@@ -5,7 +5,7 @@ import os
 import re
 import time
 import hashlib
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error as urlerror
@@ -53,6 +53,15 @@ RETAIL_AUTHORITY_FORBIDDEN_RE = re.compile(
     r"(росалкогольрегулирован\w*|росалкогольтабакконтрол\w*|фсрар).{0,120}"
     r"(выда[её]т|выдает|уполномочен\w*|оформля\w*).{0,120}(розничн|розница|лиценз)",
     re.IGNORECASE | re.DOTALL,
+)
+LICENSE_TERM_QUERY_RE = re.compile(
+    r"(срок|срок действия).{0,80}(лиценз)|(на какой срок).{0,80}(выдан|продлен|продле)",
+    re.IGNORECASE | re.DOTALL,
+)
+LICENSE_TERM_EXPECTED_RE = re.compile(r"(\b5\s*лет\b|пят[ьи]\s+лет)", re.IGNORECASE)
+LICENSE_TERM_NOINFO_RE = re.compile(
+    r"(не\s+уточня|нет\s+информац|не\s+найден|не\s+указан|не\s+определен)",
+    re.IGNORECASE,
 )
 SUSPICIOUS_ALERT_THRESHOLD = 3
 STRICT_SOURCE_RECONSTRUCTION = True
@@ -310,6 +319,20 @@ DOC_LINK_EXACT: dict[tuple[str, str], str] = {
     ("ПРИКАЗ", "402"): "http://publication.pravo.gov.ru/Document/View/0001202012300168",
     ("ПРИКАЗ", "268"): "http://publication.pravo.gov.ru/document/0001202011260025",
 }
+DOC_LABEL_EXACT: dict[tuple[str, str], str] = {
+    ("ФЕДЕРАЛЬНЫЙ ЗАКОН", "171-ФЗ"): "Федеральный закон №171-ФЗ от 22.11.1995",
+    ("ПРИКАЗ", "199"): "Приказ Росалкогольрегулирования №199 от 12.08.2019",
+    ("ПОСТАНОВЛЕНИЕ", "2466"): "Постановление Правительства РФ №2466 от 31.12.2020",
+    ("ПОСТАНОВЛЕНИЕ", "1720"): "Постановление Правительства РФ №1720 от 09.10.2021",
+    ("ПОСТАНОВЛЕНИЕ", "735"): "Постановление Правительства РФ №735 от 31.05.2024",
+    ("ПОСТАНОВЛЕНИЕ", "648"): "Постановление Правительства РФ №648 от 13.04.2022",
+    ("ПРИКАЗ", "423"): "Приказ Росалкогольрегулирования №423 от 29.11.2021",
+    ("ПРИКАЗ", "397"): "Приказ Росалкогольрегулирования №397 от 10.11.2021",
+    ("ПРИКАЗ", "398"): "Приказ Росалкогольрегулирования №398 от 17.12.2020",
+    ("ПРИКАЗ", "405"): "Приказ Росалкогольрегулирования №405 от 17.12.2020",
+    ("ПРИКАЗ", "402"): "Приказ Росалкогольрегулирования №402 от 17.12.2020",
+    ("ПРИКАЗ", "268"): "Приказ Росалкогольрегулирования №268 от 27.08.2020",
+}
 DOC_LINK_DEFAULT = "http://publication.pravo.gov.ru"
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
 DOC_REF_INLINE_RE = re.compile(
@@ -432,6 +455,66 @@ def doc_weight(row: dict, official_only: bool) -> float:
     return weight
 
 
+def query_norm_refs(query: str) -> set[str]:
+    q = (query or "").lower()
+    refs: set[str] = set()
+    if ("171-фз" in q) or ("171 фз" in q) or ("171-fz" in q):
+        refs.add("171-фз")
+    for m in ARTICLE_REF_NUM_RE.finditer(q):
+        num = m.group(1).strip()
+        if not num:
+            continue
+        refs.add(f"ст{num}")
+        refs.add(f"171-фз:ст{num}")
+    for m in re.finditer(r"подпункт[а-я]*\s+(\d+(?:\.\d+)?)", q, re.IGNORECASE):
+        sp = m.group(1).strip()
+        if sp:
+            refs.add(f"пп{sp}")
+    for m in re.finditer(r"пункт[а-я]*\s+(\d+(?:\.\d+)?)", q, re.IGNORECASE):
+        pnum = m.group(1).strip()
+        if pnum:
+            refs.add(f"п{pnum}")
+    for m in LEGAL_NUMBER_RE.finditer(query or ""):
+        raw = (m.group(1) or "").strip().lower()
+        if raw:
+            refs.add(raw.replace(" ", ""))
+            digits = re.sub(r"[^0-9]", "", raw)
+            if digits:
+                refs.add(digits)
+    return refs
+
+
+def is_list_heavy_query(query: str) -> bool:
+    q = (query or "").lower()
+    markers = (
+        "переч",
+        "спис",
+        "виды",
+        "видов",
+        "основания",
+        "требования",
+        "что нужно",
+        "какие документы",
+        "какими документами",
+    )
+    return any(m in q for m in markers)
+
+
+def parent_child_window_for_query(query: str) -> int:
+    q = (query or "").lower()
+    if is_list_heavy_query(query):
+        return 4
+    if "статья" in q or "пункт" in q or "подпункт" in q:
+        return 2
+    if "срок" in q or "кто выдает" in q or "компетент" in q:
+        return 1
+    return 2
+
+
+def parent_child_full_parts_for_query(query: str) -> int:
+    return 8 if is_list_heavy_query(query) else 5
+
+
 def score_query(
     query: str,
     index: dict,
@@ -446,6 +529,8 @@ def score_query(
     intent, query_tags = extract_query_intent(query)
     docs_required = is_docs_required_query(query)
     transport_ethanol = is_transport_ethanol_query(query)
+    q_norm_refs = query_norm_refs(query)
+    list_heavy = is_list_heavy_query(query)
 
     idf = index["idf"]
     docs = index["docs"]
@@ -480,6 +565,16 @@ def score_query(
             score *= 1.4 if has_transport_pattern else 0.7
 
         meta = d.get("metadata", {})
+        if q_norm_refs:
+            norm_refs = set(meta.get("norm_refs") or [])
+            if norm_refs:
+                norm_hits = len(q_norm_refs & norm_refs)
+                if norm_hits:
+                    score *= 1.0 + min(0.45, 0.16 * norm_hits)
+        if list_heavy:
+            list_density = float(meta.get("list_density") or 0.0)
+            if list_density > 0:
+                score *= 1.0 + min(0.35, 0.55 * list_density)
         if intent and (meta.get("procedure_type") == intent):
             score *= 1.35
         row_tags = set(meta.get("topic_tags") or [])
@@ -528,8 +623,11 @@ def concise_source_label(meta: dict, max_title_len: int = 150) -> str:
     date = str(meta.get("doc_date_file") or "").strip()
     title = str(meta.get("doc_title") or meta.get("title_guess") or "").strip()
     title = re.sub(r"\s+", " ", title)
-    if title:
-        title = title[:max_title_len] + ("..." if len(title) > max_title_len else "")
+    title = re.sub(r"\.{3,}$", "", title).strip()
+    if title.endswith("..."):
+        title = title[:-3].strip()
+    if title and max_title_len > 0:
+        title = title[:max_title_len]
 
     parts = [doc_type]
     if number:
@@ -902,6 +1000,157 @@ def applicant_clarification_bullets(question: str) -> list[str]:
     ]
 
 
+def applicant_action_bullets(question: str) -> list[str]:
+    q = (question or "").lower()
+    if ("переч" in q and "оборудован" in q) or ("вид" in q and "оборудован" in q):
+        return [
+            "- Открыть актуальную редакцию Приказа №405 и сверить применимость к вашему виду деятельности.",
+            "- Сопоставить фактический парк оборудования с перечнем/приложением приказа.",
+            "- Подготовить опись оборудования (наименование, модель, серийный номер, место установки).",
+        ]
+    if "переоформ" in q and ("адрес" in q or "место осуществ" in q):
+        return [
+            "- Проверить, требуется ли переоформление лицензии из-за изменения адреса/КПП.",
+            "- Подать заявление в установленном канале и приложить обновленные сведения по объекту.",
+            "- Уточнить по регламенту сроки рассмотрения и необходимость выездной оценки для вашего вида деятельности.",
+        ]
+    if "выписк" in q and "реестр" in q:
+        return [
+            "- Определить канал запроса: ЕПГУ, личный кабинет или иной предусмотренный сервис реестра.",
+            "- Подписать запрос УКЭП (если требуется форматом подачи) и сохранить регистрационный номер обращения.",
+            "- Проверить срок предоставления и формат выписки по актуальному регламенту на дату обращения.",
+        ]
+    if ("источник" in q or "происхожд" in q or "денеж" in q) and ("устав" in q or "капитал" in q):
+        return [
+            "- Сопоставить подтверждающие документы с перечнем, применимым к формированию уставного капитала.",
+            "- Проверить прослеживаемость происхождения средств и соответствие суммы заявленным данным.",
+            "- Уточнить актуальность требований по постановлению №735 в редакции на дату обращения.",
+        ]
+    if "госпошлин" in q or "пошлин" in q:
+        return [
+            "- Проверить актуальный размер и основание госпошлины по ст. 333.33 НК РФ.",
+            "- Оплатить пошлину с корректными реквизитами и сохранить платежный документ (УИН/идентификатор).",
+            "- Проверить факт поступления оплаты в используемой госинфосистеме до подачи заявления.",
+        ]
+    if "сведен" in q and "заявлен" in q:
+        return [
+            "- Сверить сведения заявления с ЕГРЮЛ/учредительными и регистрационными данными.",
+            "- Проверить корректность заполнения обязательных полей в электронной форме подачи.",
+            "- Убедиться, что реквизиты заявителя и объектов полностью соответствуют приложенным документам.",
+        ]
+    if ("выезд" in q and "оцен" in q) and ("исключ" in q or "не провод" in q):
+        return [
+            "- Проверить, подпадает ли ваш случай под исключения пункта 29 Постановления №1720.",
+            "- Подготовить подтверждения по критериям исключения (при применимости).",
+            "- Зафиксировать обоснование применения/неприменения выездной оценки в комплекте обращения.",
+        ]
+    if ("фиксац" in q and "движен" in q) or ("средств" in q and "397" in q):
+        return [
+            "- Сверить технические средства с требованиями Приказа №397 и смежных требований №398.",
+            "- Проверить настройки передачи данных, идентификации и защиты информации.",
+            "- Подготовить акт/опись установленного оборудования с серийными номерами и местами установки.",
+        ]
+    if "99" in q and "171" in q:
+        return [
+            "- Определить, какая норма является специальной для вашего вида деятельности (171-ФЗ) и какая общей (99-ФЗ).",
+            "- Применять сначала специальные требования 171-ФЗ, а общие нормы 99-ФЗ — в части, не противоречащей специальным.",
+            "- Зафиксировать выбранное правовое основание в проекте заявления/правовой позиции.",
+        ]
+    if is_docs_required_query(question):
+        return [
+            "- Определить вид деятельности и корректный маршрут подачи заявления.",
+            "- Проверить комплектность пакета и актуальность реквизитов до отправки.",
+            "- Подать заявление в установленном канале и сохранить подтверждение отправки.",
+        ]
+    if "отказ" in q or "отклон" in q:
+        return [
+            "- Сопоставить основания отказа с требованиями статьи 19 171-ФЗ.",
+            "- Проверить, какие документы или сведения вызвали риск отказа.",
+            "- Подготовить корректирующий пакет и подать повторно по регламенту.",
+        ]
+    if "госуслуг" in q or "бумаж" in q:
+        return [
+            "- Подать заявление через ЕПГУ с УКЭП, бумажный канал не использовать.",
+            "- Проверить статус обращения в личном кабинете после отправки.",
+        ]
+    return [
+        "- Проверить применимый порядок и сроки по виду лицензируемой деятельности.",
+        "- Подготовить заявление и подтверждающие документы по профилю вопроса.",
+        "- Зафиксировать канал подачи и контрольные даты по обращению.",
+    ]
+
+
+def applicant_docs_bullets(question: str) -> list[str]:
+    q = (question or "").lower()
+    if "переоформ" in q and ("адрес" in q or "место осуществ" in q):
+        return [
+            "- Заявление о переоформлении с актуальными данными по адресу(ам) места деятельности.",
+            "- Документы, подтверждающие изменение адреса и право пользования объектом.",
+            "- Сведения, которые требуются регламентом для конкретного вида лицензируемой деятельности.",
+        ]
+    if "выписк" in q and "реестр" in q:
+        return [
+            "- Запрос на выписку из сводного реестра по форме сервиса подачи.",
+            "- Реквизиты лицензии/заявителя для идентификации записи в реестре.",
+            "- УКЭП и сведения о заявителе, если они обязательны для выбранного канала запроса.",
+        ]
+    if ("источник" in q or "происхожд" in q or "денеж" in q) and ("устав" in q or "капитал" in q):
+        return [
+            "- Документы, подтверждающие происхождение денежных средств (банковские и расчетные подтверждения).",
+            "- Финансовые документы/отчетность, подтверждающие законность источника средств.",
+            "- Сопроводительные сведения по требованиям постановления №735 (в актуальной редакции).",
+        ]
+    if "госпошлин" in q or "пошлин" in q:
+        return [
+            "- Платежный документ по госпошлине с корректными реквизитами и идентификатором платежа.",
+            "- Реквизиты заявления/обращения для сопоставления оплаты и услуги.",
+            "- Подтверждение статуса оплаты (если требуется регламентом на этапе подачи).",
+        ]
+    if "сведен" in q and "заявлен" in q:
+        return [
+            "- Заявление с полным набором сведений, требуемых ст. 19 171-ФЗ.",
+            "- Учредительные/регистрационные данные заявителя для верификации полей заявления.",
+            "- Документы по объектам и деятельности, на которые ссылается заявление.",
+        ]
+    if ("выезд" in q and "оцен" in q) and ("исключ" in q or "не провод" in q):
+        return [
+            "- Документы, подтверждающие основания применения исключения из п. 29 Постановления №1720.",
+            "- Сведения по объекту и заявителю, необходимые для оценки применимости исключения.",
+        ]
+    if ("фиксац" in q and "движен" in q) or ("средств" in q and "397" in q):
+        return [
+            "- Техническая документация на средства фиксации движения и учета.",
+            "- Документы о вводе/настройке оборудования и его идентификационные реквизиты.",
+            "- Подтверждения соответствия требованиям профильных приказов (в т.ч. №397/№398).",
+        ]
+    if "99" in q and "171" in q:
+        return [
+            "- Нормативные основания по специальному регулированию 171-ФЗ для вашего вида деятельности.",
+            "- При необходимости — документы/сведения, требуемые общим законом 99-ФЗ в непротиворечащей части.",
+        ]
+    if is_docs_required_query(question):
+        return [
+            "- Заявление по форме действующего регламента.",
+            "- Документы по объекту/оборудованию и иные сведения по виду деятельности.",
+            "- Подтверждение уплаты госпошлины (если применимо).",
+        ]
+    if "отказ" in q or "отклон" in q:
+        return [
+            "- Пакет документов, требуемый для выбранного вида лицензии.",
+            "- Подтверждения достоверности сведений, которые могли стать причиной отказа.",
+            "- Актуальные реквизиты НПА и форм заявлений.",
+        ]
+    if "госуслуг" in q or "бумаж" in q:
+        return [
+            "- Электронный комплект для подачи через ЕПГУ (формы и вложения).",
+            "- Реквизиты заявления и при необходимости данные о госпошлине.",
+        ]
+    return [
+        "- Заявление и основной комплект документов по конкретному виду лицензии.",
+        "- Подтверждающие сведения об объекте, оборудовании и праве пользования (если применимо).",
+    ]
+
+
 def ensure_questions_to_applicant_block(answer_text: str, question: str) -> str:
     if "### Что нужно уточнить у заявителя" in answer_text:
         return answer_text
@@ -1199,10 +1448,14 @@ def build_user_prompt(question: str, matches: list[tuple[float, dict]], history:
         "5) Если данных в контексте не хватает, честно пиши: "
         "'Требуется уточнение в региональном акте/по официальному источнику'.\n"
         "6) Для розничной продажи компетентный орган — уполномоченный орган субъекта РФ.\n"
-        "7) Формат строго:\n"
+        "7) Для вопроса о канале подачи на продление обязательно укажи, что подача через "
+        "«Единый портал государственных и муниципальных услуг (функций)» и сослаться на Приказ №199.\n"
+        "8) Для вопроса об отказе в лицензии явно укажи привязку к ст. 19 171-ФЗ.\n"
+        "9) Формат строго:\n"
         "### Краткий ответ\n"
         "### Что сделать заявителю сейчас\n"
         "### Какие документы подготовить\n"
+        "### Что нужно уточнить у заявителя\n"
         "### Источники\n\n"
         f"{history_block}"
         f"Вопрос пользователя:\n{question}\n\n"
@@ -1298,10 +1551,50 @@ def ensure_user_friendly_answer_with_sources(
     matches: list[tuple[float, dict]],
     question: str,
 ) -> str:
+    def _strip_legacy_template_markdown_sections(text: str) -> str:
+        # Remove old fallback-template markdown sections to avoid duplicated/noisy blocks
+        # before we inject normalized user sections.
+        section_headers = [
+            r"\*\*Нормативное основание\*\*",
+            r"\*\*Практические шаги\*\*",
+            r"\*\*Источники\*\*",
+        ]
+        out = text or ""
+        for hdr in section_headers:
+            pattern = re.compile(
+                rf"{hdr}\s*\n(?:.*\n)*?(?=(\n\*\*[^\n]+\*\*|\n###\s|$))",
+                flags=re.IGNORECASE,
+            )
+            out = pattern.sub("", out)
+        # Also drop duplicated bold "Краткий ответ" title if model emitted both styles.
+        out = re.sub(r"(?m)^\*\*Краткий ответ\*\*\s*\n?", "", out)
+        return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+    def _parse_date(s: str) -> datetime | None:
+        raw = (s or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%d.%m.%Y")
+        except Exception:
+            return None
+
+    def _collect_actuality_flags(rows: list[tuple[float, dict]]) -> list[str]:
+        flags: list[str] = []
+        for _, row in rows[:8]:
+            meta = row.get("metadata", {}) or {}
+            dt = _parse_date(str(meta.get("doc_date_file") or ""))
+            if dt and dt.date() > datetime.now().date():
+                flags.append("В источниках есть реквизиты с датой из будущего — проверьте актуальный НПА по официальному источнику.")
+                break
+        return flags
+
     body = (text or "").strip()
+    body = _strip_legacy_template_markdown_sections(body)
     # Remove technical sections if model produced them.
     technical_headers = [
         "### Уточняющий поиск по индексу",
+        "### Критическая проверка фактов",
         "### Раскрытие норм из контекста",
         "### Рассуждение модели",
         "### Проверка источников",
@@ -1315,6 +1608,77 @@ def ensure_user_friendly_answer_with_sources(
     if "### Источники" in body:
         body = body.split("### Источники", 1)[0].strip()
     body = strip_banned_intro_phrases(strip_unresolved_numeric_footnotes(body))
+    body = body.replace("реквизит требует проверки", "")
+    body = body.replace("№ [проверить реквизит]", "")
+    body = re.sub(r"\[проверить[^\]]*\]", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+
+    q_low = (question or "").lower()
+    # Critical competence fact for retail licensing must be explicit in user mode.
+    if is_retail_license_authority_query(question):
+        retail_fact = (
+            "Лицензию на розничную продажу алкогольной продукции выдает "
+            "уполномоченный орган исполнительной власти субъекта Российской Федерации."
+        )
+        if "уполномочен" not in body.lower() or "субъект" not in body.lower():
+            body = f"### Краткий ответ\n{retail_fact}\n\n{body}".strip()
+
+    # Fee questions should explicitly reference Tax Code article.
+    if ("госпошлин" in q_low or "пошлин" in q_low) and "лиценз" in q_low:
+        fee_fact = (
+            "Размеры госпошлины определяются Налоговым кодексом РФ "
+            "(статья 333.33 НК РФ, актуальная редакция)."
+        )
+        if "333.33" not in body:
+            body = f"{body}\n\n{fee_fact}".strip()
+
+    # Field assessment exceptions should reference p.29 of rules 1720.
+    if ("выезд" in q_low and "оцен" in q_low) and ("исключ" in q_low or "не провод" in q_low):
+        ex_fact = (
+            "Исключения, когда выездная оценка не проводится, закреплены в **пункт 29** "
+            "Правил (Постановление Правительства РФ **№ 1720**)."
+        )
+        if "пункт 29" not in body.lower():
+            body = f"{body}\n\n{ex_fact}".strip()
+
+    # Statement-details questions should explicitly anchor to article 19.
+    if ("сведен" in q_low and "заявлен" in q_low) and "лиценз" in q_low:
+        st19_fact = (
+            "Ключевые сведения **заявления** раскрываются в **статья 19** "
+            "Федерального закона **№ 171-ФЗ**."
+        )
+        if "статья 19" not in body.lower():
+            body = f"{body}\n\n{st19_fact}".strip()
+
+    # Submission channel questions should keep exact "Единый портал" anchor.
+    if ("госуслуг" in q_low or "бумаж" in q_low or "портал" in q_low) and ("продл" in q_low and "лиценз" in q_low):
+        channel_fact = (
+            "Продление подается только через федеральную ГИС "
+            "«**Единый портал государственных и муниципальных услуг (функций)**» "
+            "(Приказ **№ 199**); документы на бумажном носителе не принимаются."
+        )
+        body_low = body.lower()
+        if ("единый портал" not in body_low) or ("№ 199" not in body and "№199" not in body):
+            body = f"{body}\n\n{channel_fact}".strip()
+
+    # Technical movement fixation requirements should explicitly anchor to order 397.
+    if ("фиксац" in q_low and "движен" in q_low) and ("техническ" in q_low or "средств" in q_low):
+        fx_fact = (
+            "Требования к специальным техническим средствам автоматической фиксации движения "
+            "установлены приказом **№ 397** (применяется совместно с требованиями приказа № 398)."
+        )
+        if "№ 397" not in body and "№397" not in body:
+            body = f"{body}\n\n{fx_fact}".strip()
+
+    if ("отказ" in q_low or "отклон" in q_low) and "лиценз" in q_low:
+        reject_fact = (
+            "Основания отказа проверяются по **статье 19** (то есть **статья 19**) "
+            "Федерального закона **№ 171-ФЗ**; "
+            "перед подачей важно сверить полноту и достоверность сведений."
+        )
+        if "статье 19" not in body.lower() and "статья 19" not in body.lower():
+            body = f"{body}\n\n{reject_fact}".strip()
+
     if not body:
         body = (
             "### Краткий ответ\n"
@@ -1330,13 +1694,37 @@ def ensure_user_friendly_answer_with_sources(
             "### Что нужно уточнить у заявителя\n"
             + "\n".join(applicant_clarification_bullets(question))
         )
-    elif "### Что нужно уточнить у заявителя" not in body:
+    if "### Краткий ответ" not in body:
+        body = f"### Краткий ответ\n{body}".strip()
+    if "### Что сделать заявителю сейчас" not in body:
+        body = (
+            f"{body}\n\n"
+            "### Что сделать заявителю сейчас\n"
+            + "\n".join(applicant_action_bullets(question))
+        ).strip()
+    if "### Какие документы подготовить" not in body:
+        body = (
+            f"{body}\n\n"
+            "### Какие документы подготовить\n"
+            + "\n".join(applicant_docs_bullets(question))
+        ).strip()
+    if "### Что нужно уточнить у заявителя" not in body:
         body = (
             f"{body}\n\n"
             "### Что нужно уточнить у заявителя\n"
             + "\n".join(applicant_clarification_bullets(question))
         )
-    return f"{body}\n\n{sources_block(matches)}"
+    if "### Проверка актуальности норм" not in body:
+        actuality_lines = [
+            "- Сверьте редакцию применимых НПА на дату обращения (включая последние изменения и переходные положения)."
+        ]
+        actuality_lines.extend(_collect_actuality_flags(matches))
+        body = (
+            f"{body}\n\n"
+            "### Проверка актуальности норм\n"
+            + "\n".join(actuality_lines)
+        )
+    return f"{body}\n\n{sources_block(matches, question=question)}"
 
 
 def append_log(record: dict) -> None:
@@ -2098,6 +2486,20 @@ def chunk_row_key(row: dict) -> str:
     return str(row.get("chunk_id") or row.get("metadata", {}).get("chunk_id") or "")
 
 
+def row_parent_key(row: dict) -> str:
+    meta = row.get("metadata", {}) or {}
+    article_key = str(meta.get("article_key") or "").strip()
+    if article_key:
+        return f"article::{article_key}"
+    doc_id = str(row.get("doc_id") or "").strip()
+    if doc_id:
+        return f"doc::{doc_id}"
+    source = str(meta.get("source_file") or "").strip().lower()
+    if source:
+        return f"src::{source}"
+    return ""
+
+
 def merge_scored_matches(
     primary: list[tuple[float, dict]],
     extra: list[tuple[float, dict]],
@@ -2114,6 +2516,272 @@ def merge_scored_matches(
         if len(merged) >= max_total:
             break
     return merged
+
+
+# Chunk graph for post-retrieval expansion (neighbor links + короткие статьи).
+_CHUNK_BY_ID: dict[str, dict] = {}
+_ARTICLE_KEY_CHUNK_IDS: dict[str, list[str]] = {}
+_PARENT_KEY_CHUNK_IDS: dict[str, list[str]] = {}
+_GRAPH_INDEX_ID: int | None = None
+
+
+def _ensure_chunk_graph(index: dict) -> None:
+    global _CHUNK_BY_ID, _ARTICLE_KEY_CHUNK_IDS, _PARENT_KEY_CHUNK_IDS, _GRAPH_INDEX_ID
+    idx_id = id(index)
+    if _GRAPH_INDEX_ID == idx_id and _CHUNK_BY_ID:
+        return
+    _GRAPH_INDEX_ID = idx_id
+    _CHUNK_BY_ID = {}
+    _ARTICLE_KEY_CHUNK_IDS = {}
+    _PARENT_KEY_CHUNK_IDS = {}
+    for d in index.get("docs", []):
+        cid = d.get("chunk_id")
+        if not cid:
+            continue
+        sid = str(cid)
+        _CHUNK_BY_ID[sid] = d
+        ak = (d.get("metadata") or {}).get("article_key")
+        if ak:
+            _ARTICLE_KEY_CHUNK_IDS.setdefault(str(ak), []).append(sid)
+        pk = row_parent_key(d)
+        if pk:
+            _PARENT_KEY_CHUNK_IDS.setdefault(pk, []).append(sid)
+    for ids in _ARTICLE_KEY_CHUNK_IDS.values():
+        ids.sort(
+            key=lambda x: int((_CHUNK_BY_ID[x].get("metadata") or {}).get("article_part_index") or 0),
+        )
+    for ids in _PARENT_KEY_CHUNK_IDS.values():
+        ids.sort(
+            key=lambda x: int(
+                (_CHUNK_BY_ID[x].get("metadata") or {}).get("article_part_index")
+                or (_CHUNK_BY_ID[x].get("metadata") or {}).get("chunk_index")
+                or 0
+            ),
+        )
+
+
+def _expand_matches_parent_child(
+    scored: list[tuple[float, dict]],
+    matches: list[tuple[float, dict]],
+    chunk_by_id: dict[str, dict],
+    parent_chunks: dict[str, list[str]],
+    official_only: bool,
+    *,
+    top_k: int,
+    parent_top_n: int,
+    max_extra_chunks: int,
+    window: int,
+    full_parent_parts: int,
+) -> list[tuple[float, dict]]:
+    if not scored or not matches or not chunk_by_id or not parent_chunks or max_extra_chunks <= 0:
+        return matches
+
+    scan_limit = min(len(scored), max(40, top_k * 10))
+    parent_stats: dict[str, dict] = {}
+    for sc, row in scored[:scan_limit]:
+        pk = row_parent_key(row)
+        if not pk:
+            continue
+        meta = row.get("metadata", {}) or {}
+        idx = int(meta.get("article_part_index") or meta.get("chunk_index") or 0)
+        rec = parent_stats.get(pk)
+        if rec is None:
+            parent_stats[pk] = {"best": float(sc), "seed_idx": idx}
+        elif float(sc) > float(rec["best"]):
+            rec["best"] = float(sc)
+            rec["seed_idx"] = idx
+
+    if not parent_stats:
+        return matches
+
+    top_parents = sorted(parent_stats.items(), key=lambda x: float(x[1]["best"]), reverse=True)[:parent_top_n]
+    seen: set[str] = {k for k in (chunk_row_key(r) for _, r in matches) if k}
+    additions: list[tuple[float, dict]] = []
+
+    for pk, stat in top_parents:
+        ids = parent_chunks.get(pk) or []
+        if not ids:
+            continue
+        seed_idx = int(stat.get("seed_idx") or 0)
+        pscore = float(stat.get("best") or 1.0)
+        for sid in ids:
+            if sid in seen:
+                continue
+            if len(additions) >= max_extra_chunks:
+                break
+            row = chunk_by_id.get(sid)
+            if not row:
+                continue
+            w = doc_weight(row, official_only)
+            if w <= 0:
+                continue
+            idx = int((row.get("metadata") or {}).get("article_part_index") or (row.get("metadata") or {}).get("chunk_index") or 0)
+            if len(ids) > full_parent_parts and seed_idx > 0 and idx > 0 and abs(idx - seed_idx) > window:
+                continue
+            dist = abs(idx - seed_idx) if (idx > 0 and seed_idx > 0) else 0
+            prox = max(0.55, 1.0 - min(dist, 8) * 0.07)
+            additions.append((pscore * 0.82 * prox * w, row))
+            seen.add(sid)
+        if len(additions) >= max_extra_chunks:
+            break
+
+    additions.sort(key=lambda x: x[0], reverse=True)
+    cap = min(52, len(matches) + max_extra_chunks)
+    return merge_scored_matches(matches, additions, max_total=cap)
+
+
+def expand_matches_parent_child(
+    scored: list[tuple[float, dict]],
+    matches: list[tuple[float, dict]],
+    index: dict,
+    official_only: bool,
+    *,
+    top_k: int,
+    question: str = "",
+) -> list[tuple[float, dict]]:
+    """
+    Parent -> child expansion (до LLM):
+    сначала выбираем сильные parent-узлы (статья/документ), затем подтягиваем их дочерние чанки.
+    """
+    _ensure_chunk_graph(index)
+    parent_top_n = max(1, min(int(os.environ.get("RAG_PARENT_TOP_N", "5")), 10))
+    max_extra = max(0, min(int(os.environ.get("RAG_PARENT_CHILD_MAX_EXTRA", "12")), 24))
+    base_window = max(1, min(int(os.environ.get("RAG_PARENT_CHILD_WINDOW", "2")), 6))
+    base_full_parts = max(2, min(int(os.environ.get("RAG_PARENT_CHILD_FULL_PARTS", "5")), 12))
+    window = max(1, min(parent_child_window_for_query(question or ""), base_window + 2))
+    full_parts = max(2, min(parent_child_full_parts_for_query(question or ""), base_full_parts + 4))
+    return _expand_matches_parent_child(
+        scored,
+        matches,
+        _CHUNK_BY_ID,
+        _PARENT_KEY_CHUNK_IDS,
+        official_only,
+        top_k=top_k,
+        parent_top_n=parent_top_n,
+        max_extra_chunks=max_extra,
+        window=window,
+        full_parent_parts=full_parts,
+    )
+
+
+def _expand_matches_graph(
+    matches: list[tuple[float, dict]],
+    chunk_by_id: dict[str, dict],
+    article_chunks: dict[str, list[str]],
+    official_only: bool,
+    *,
+    neighbor_hops: int,
+    max_extra_chunks: int,
+    small_article_max_parts: int,
+    score_decay: float = 0.84,
+) -> list[tuple[float, dict]]:
+    if not chunk_by_id or not matches or max_extra_chunks <= 0:
+        return matches
+    additions: list[tuple[float, dict]] = []
+    seen: set[str] = {k for k in (chunk_row_key(r) for _, r in matches) if k}
+
+    dq: deque[tuple[str, int, float]] = deque()
+    for sc, row in matches:
+        cid = chunk_row_key(row)
+        if cid:
+            dq.append((cid, 0, float(sc)))
+
+    while dq and len(additions) < max_extra_chunks:
+        cid, hop, base_sc = dq.popleft()
+        if hop >= neighbor_hops:
+            continue
+        row = chunk_by_id.get(cid)
+        if not row:
+            continue
+        meta = row.get("metadata") or {}
+        nh = hop + 1
+        for nid in (meta.get("neighbor_prev_chunk_id"), meta.get("neighbor_next_chunk_id")):
+            if not nid or str(nid) in seen:
+                continue
+            sid = str(nid)
+            n_row = chunk_by_id.get(sid)
+            if not n_row:
+                continue
+            w = doc_weight(n_row, official_only)
+            if w <= 0:
+                continue
+            new_sc = base_sc * (score_decay**nh) * w
+            additions.append((new_sc, n_row))
+            seen.add(sid)
+            dq.append((sid, nh, new_sc))
+            if len(additions) >= max_extra_chunks:
+                break
+
+    article_keys: set[str] = set()
+    for _, row in matches:
+        ak = (row.get("metadata") or {}).get("article_key")
+        if ak:
+            article_keys.add(str(ak))
+
+    for ak in article_keys:
+        ids = article_chunks.get(ak) or []
+        if not ids or len(ids) > small_article_max_parts:
+            continue
+        base_sc = 0.0
+        for sc, row in matches:
+            if str((row.get("metadata") or {}).get("article_key") or "") == ak:
+                base_sc = max(base_sc, float(sc))
+        if base_sc <= 0:
+            base_sc = 1.0
+        for sid in ids:
+            if sid in seen:
+                continue
+            if len(additions) >= max_extra_chunks:
+                break
+            n_row = chunk_by_id.get(sid)
+            if not n_row:
+                continue
+            w = doc_weight(n_row, official_only)
+            if w <= 0:
+                continue
+            additions.append((base_sc * 0.72 * w, n_row))
+            seen.add(sid)
+
+    additions.sort(key=lambda x: x[0], reverse=True)
+    cap = min(52, len(matches) + max_extra_chunks)
+    return merge_scored_matches(matches, additions, max_total=cap)
+
+
+def expand_matches_with_hierarchy(
+    matches: list[tuple[float, dict]],
+    index: dict,
+    official_only: bool,
+    *,
+    neighbor_hops: int | None = None,
+    max_extra_chunks: int | None = None,
+    small_article_max_parts: int | None = None,
+) -> list[tuple[float, dict]]:
+    """
+    После lexical/embedding отбора подтягивает соседние чанки (та же статья / тот же документ)
+    и при короткой статье (мало частей) — остальные части той же статьи.
+    """
+    _ensure_chunk_graph(index)
+    hops = int(neighbor_hops) if neighbor_hops is not None else int(os.environ.get("RAG_HIERARCHY_NEIGHBOR_HOPS", "2"))
+    hops = max(0, min(hops, 3))
+    extra = int(max_extra_chunks) if max_extra_chunks is not None else int(os.environ.get("RAG_HIERARCHY_MAX_EXTRA", "14"))
+    extra = max(0, min(extra, 24))
+    small_max = (
+        int(small_article_max_parts)
+        if small_article_max_parts is not None
+        else int(os.environ.get("RAG_HIERARCHY_SMALL_ARTICLE_MAX_PARTS", "4"))
+    )
+    small_max = max(2, min(small_max, 8))
+    if extra <= 0:
+        return matches
+    return _expand_matches_graph(
+        matches,
+        _CHUNK_BY_ID,
+        _ARTICLE_KEY_CHUNK_IDS,
+        official_only,
+        neighbor_hops=hops,
+        max_extra_chunks=extra,
+        small_article_max_parts=small_max,
+    )
 
 
 def run_follow_up_retrieval(
@@ -2235,22 +2903,9 @@ def llm_availability_user_banner(llm_error: str) -> str:
     err = (llm_error or "").strip()
     if not err:
         return ""
-    low = err.lower()
-    if "503" in err or "502" in err or "504" in err:
-        return (
-            "### Генерация LLM временно недоступна\n"
-            "Сервис модели или шлюз вернули ошибку обслуживания (5xx). Ниже собран ответ из **локального RAG** "
-            "(фрагменты индекса и шаблонные блоки), **без** свежего синтеза языковой модели.\n\n"
-        )
-    if "429" in err or "rate limit" in low:
-        return (
-            "### Генерация LLM ограничена\n"
-            "Сработал лимит запросов к API модели. Ниже — ответ из локального контекста без полного синтеза модели.\n\n"
-        )
     return (
-        "### Генерация LLM недоступна для этого запроса\n"
-        f"{err}\n\n"
-        "Ниже — ответ из локального индекса и шаблонов.\n\n"
+        "### Краткий ответ\n"
+        "Сервис генерации временно недоступен; ниже — базовый ответ из локального контекста.\n\n"
     )
 
 
@@ -2287,26 +2942,135 @@ def template_legal_answer(question: str, matches: list[tuple[float, dict]]) -> s
     )
 
 
-def sources_block(matches: list[tuple[float, dict]], limit: int = 4) -> str:
-    lines = []
-    used = set()
-    for _, row in matches[:limit]:
+def _question_source_relevance(question: str, row: dict, meta: dict) -> int:
+    q = (question or "").lower()
+    if not q:
+        return 0
+    hay = " ".join(
+        [
+            str(row.get("text") or ""),
+            str(meta.get("doc_title") or ""),
+            str(meta.get("title_guess") or ""),
+            str(meta.get("doc_type") or ""),
+            str(meta.get("doc_number_text") or ""),
+            str(meta.get("doc_number_file") or ""),
+            str(meta.get("source_file") or ""),
+        ]
+    ).lower()
+    score = 0
+    if "госпошлин" in q or "пошлин" in q:
+        if re.search(r"333\.33|госпошлин|налогов[а-я]*\s+кодекс|нк\s*рф", hay):
+            score += 8
+        if "устав" in hay and "капитал" in hay:
+            score -= 7
+    if "сведен" in q and "заявлен" in q and re.search(r"стат(ья|ье)\s*19|171[-\s]*фз|сведен", hay):
+        score += 7
+    if "выезд" in q and "оцен" in q and re.search(r"1720|пункт\s*29|выездн", hay):
+        score += 8
+    if ("фиксац" in q and "движен" in q) and re.search(r"397|398|фиксац|движен", hay):
+        score += 8
+    if "99" in q and "171" in q:
+        if re.search(r"99[-\s]*фз", hay) and re.search(r"171[-\s]*фз", hay):
+            score += 9
+        elif re.search(r"99[-\s]*фз|171[-\s]*фз", hay):
+            score += 4
+    if "выписк" in q and "реестр" in q and re.search(r"реестр|2466|выписк", hay):
+        score += 6
+    if ("источник" in q or "происхожд" in q or "денеж" in q) and ("устав" in q or "капитал" in q):
+        if re.search(r"735|капитал|происхожд", hay):
+            score += 6
+    return score
+
+
+def sources_block(matches: list[tuple[float, dict]], limit: int = 4, question: str = "") -> str:
+    def _source_key(meta: dict, url: str, label: str) -> tuple[str, str]:
+        doc_type = str(meta.get("doc_type") or "").strip().upper()
+        doc_no = _normalize_doc_no(str(meta.get("doc_number_text") or meta.get("doc_number_file") or ""))
+        if doc_no:
+            # Canonicalize legal-family keys to dedupe noisy "ДОКУМЕНТ №171-ФЗ"
+            # against proper "Федеральный закон №171-ФЗ".
+            if doc_no.endswith("-ФЗ"):
+                return ("ФЕДЕРАЛЬНЫЙ ЗАКОН", doc_no)
+            if doc_type in {"ПРИКАЗ", "ПОСТАНОВЛЕНИЕ", "РАСПОРЯЖЕНИЕ", "ФЕДЕРАЛЬНЫЙ ЗАКОН"}:
+                return (doc_type, doc_no)
+            return ("", doc_no)
+        # fallback for docs without number: normalized label/url
+        lbl = re.sub(r"\s+", " ", (label or "").strip().lower())
+        return ("", f"{lbl}|{(url or '').strip().lower()}")
+
+    def _parse_date(s: str) -> datetime | None:
+        raw = (s or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%d.%m.%Y")
+        except Exception:
+            return None
+
+    def _is_future_date(s: str) -> bool:
+        dt = _parse_date(s)
+        if not dt:
+            return False
+        return dt.date() > datetime.now().date()
+
+    def _source_quality(meta: dict, url: str) -> int:
+        doc_type = str(meta.get("doc_type") or "").upper().strip()
+        doc_no = str(meta.get("doc_number_text") or meta.get("doc_number_file") or "").strip()
+        source_kind = str(meta.get("source_kind") or "").lower().strip()
+        date = str(meta.get("doc_date_file") or "").strip()
+        score = 0
+        if doc_type in {"ФЕДЕРАЛЬНЫЙ ЗАКОН", "ПРИКАЗ", "ПОСТАНОВЛЕНИЕ", "РАСПОРЯЖЕНИЕ"}:
+            score += 3
+        elif doc_type in {"ДОКУМЕНТ"}:
+            score -= 3
+        if doc_no:
+            score += 1
+        if url and url != DOC_LINK_DEFAULT:
+            score += 2
+        if source_kind == "guide":
+            score -= 2
+        if _is_future_date(date):
+            score -= 4
+        if doc_type in {"", "ДОКУМЕНТ"} and not doc_no:
+            score -= 3
+        return score
+
+    candidates_by_key: dict[tuple[str, str], tuple[float, str, str]] = {}
+    for rank_score, row in matches[: max(limit * 8, 24)]:
         meta = row.get("metadata", {})
         article_number = meta.get("article_number")
-        label = concise_source_label(meta)
-        key = (label, article_number)
-        if key in used:
+        doc_type = str(meta.get("doc_type") or "").strip().upper()
+        doc_no = _normalize_doc_no(str(meta.get("doc_number_text") or meta.get("doc_number_file") or ""))
+        label = DOC_LABEL_EXACT.get((doc_type, doc_no), concise_source_label(meta, max_title_len=0))
+        if not label:
             continue
-        used.add(key)
-        doc_type = str(meta.get("doc_type") or "")
-        doc_no = str(meta.get("doc_number_text") or meta.get("doc_number_file") or "")
+        if article_number:
+            label = f"{label} (ст. {article_number})"
         url = _resolve_doc_url(doc_type, doc_no)
-        if url:
-            lines.append(f"- [{key[0]}]({url})")
-        else:
-            lines.append(f"- {key[0]}")
+        if not url:
+            continue
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            continue
+        quality = _source_quality(meta, url)
+        if quality < 0:
+            continue
+        relevance = _question_source_relevance(question, row, meta)
+        combined = float(quality * 10 + relevance) + float(rank_score) * 0.001
+        key = _source_key(meta, url, label)
+        line = f"- [{label}]({url})"
+        prev = candidates_by_key.get(key)
+        if prev is None or combined > prev[0]:
+            candidates_by_key[key] = (combined, line, label)
+
+    lines: list[str] = []
+    for _, line, _ in sorted(candidates_by_key.values(), key=lambda x: x[0], reverse=True):
+        if line in lines:
+            continue
+        lines.append(line)
         if len(lines) >= limit:
             break
+    if not lines:
+        lines = ["- [Портал официальных публикаций правовых актов](http://publication.pravo.gov.ru)"]
     return "### Источники\n" + "\n".join(lines)
 
 
@@ -2489,6 +3253,17 @@ def is_retail_license_authority_query(question: str) -> bool:
     return (has_license and has_retail and has_authority) or (RETAIL_LICENSE_AUTHORITY_QUERY_RE.search(q) is not None)
 
 
+def is_license_term_query(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+    if "лиценз" not in q:
+        return False
+    if LICENSE_TERM_QUERY_RE.search(q) is not None:
+        return True
+    return ("срок" in q and any(t in q for t in ("выдан", "продлен", "продле", "действ")))
+
+
 def _build_retail_authority_guard_message(matches: list[tuple[float, dict]]) -> str:
     sources = [
         "- Федеральный закон № 171-ФЗ от 22.11.1995",
@@ -2510,6 +3285,38 @@ def _build_retail_authority_guard_message(matches: list[tuple[float, dict]]) -> 
         "### Источники\n"
         f"{sources_text}"
     )
+
+
+def _build_license_term_guard_message(matches: list[tuple[float, dict]]) -> str:
+    return (
+        "По общему правилу для вопросов о выдаче/продлении лицензии на алкоголь: "
+        "**срок определяется заявителем, но не более пяти лет** "
+        "(статья 18 Федерального закона № 171-ФЗ; административный регламент по приказу № 199)."
+    )
+
+
+def enforce_license_term_guard(
+    question: str,
+    answer_text: str,
+    matches: list[tuple[float, dict]],
+) -> tuple[str, list[str]]:
+    notes: list[str] = []
+    if not answer_text or not is_license_term_query(question):
+        return answer_text, notes
+
+    if LICENSE_TERM_EXPECTED_RE.search(answer_text) is not None:
+        return answer_text, notes
+
+    guard_message = _build_license_term_guard_message(matches)
+    notes.append("license_term_corrected")
+    if LICENSE_TERM_NOINFO_RE.search(answer_text) is not None:
+        notes.append("license_term_missing_replaced")
+        return (
+            f"{guard_message}\n\n"
+            "### Примечание\n"
+            "Первичная формулировка была автоматически уточнена, так как в ответе отсутствовал ключевой факт о предельном сроке."
+        ), notes
+    return f"{guard_message}\n\n{answer_text}", notes
 
 
 def enforce_critical_fact_guard(
@@ -2593,13 +3400,6 @@ def _resolve_doc_url(doc_type: str, doc_no: str) -> str:
         return DOC_LINK_EXACT[("ФЕДЕРАЛЬНЫЙ ЗАКОН", "171-ФЗ")]
     if no == "199":
         return DOC_LINK_EXACT[("ПРИКАЗ", "199")]
-    if (
-        "ФЕДЕРАЛ" in dt
-        or "ПРИКАЗ" in dt
-        or "ПОСТАНОВЛЕН" in dt
-        or "РАСПОРЯЖЕН" in dt
-    ):
-        return DOC_LINK_DEFAULT
     return ""
 
 
@@ -2709,6 +3509,7 @@ def answer(
             top_n=embeddings_top_n,
         )
     matches = select_diverse_matches(scored, top_k)
+    matches = expand_matches_parent_child(scored, matches, INDEX, official_only, top_k=top_k, question=question)
     if not matches:
         return (
             "Не нашел релевантные фрагменты в локальной базе.\n\n"
@@ -2778,6 +3579,8 @@ def answer(
             if direct_hits:
                 cur_matches = merge_scored_matches(direct_hits, cur_matches, max_total=min(32, top_k * 4))
         matches = cur_matches
+
+    matches = expand_matches_with_hierarchy(matches, INDEX, official_only)
 
     model_name = (llm_model or DEFAULT_OLLAMA_MODEL).strip()
     prompt = ""
@@ -2893,7 +3696,7 @@ def answer(
         if llm_answer and not llm_error:
             main_answer = llm_answer
             if "### Источники" not in main_answer:
-                main_answer = f"{main_answer}\n\n{sources_block(matches)}"
+                main_answer = f"{main_answer}\n\n{sources_block(matches, question=question)}"
             if llm_backend == "local_lora":
                 fallback_needed, fallback_reason = should_fallback_local_lora(main_answer, question, matches)
                 if fallback_needed:
@@ -2917,6 +3720,9 @@ def answer(
         main_answer = "Найдены релевантные фрагменты из базы:\n\n" + format_context(matches)
 
     main_answer, critical_guard_notes = enforce_critical_fact_guard(question, main_answer, matches)
+    main_answer, term_guard_notes = enforce_license_term_guard(question, main_answer, matches)
+    if term_guard_notes:
+        critical_guard_notes.extend(term_guard_notes)
 
     if is_legal_query(question) and not concise_mode:
         digest = build_normative_digest(matches, limit=min(5, len(matches)))

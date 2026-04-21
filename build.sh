@@ -37,6 +37,7 @@ from pathlib import Path
 
 rtf = Path("processed/cleaned_docs_rtf.jsonl")
 extra = Path("processed/extra_docs.jsonl")
+extra_egais = Path("processed/extra_docs_egais_centerinform.jsonl")
 merged = Path("processed/cleaned_docs.jsonl")
 
 with merged.open("w", encoding="utf-8") as out:
@@ -48,6 +49,12 @@ with merged.open("w", encoding="utf-8") as out:
             if not extra_text.endswith("\n"):
                 extra_text += "\n"
             out.write(extra_text)
+    if extra_egais.exists():
+        egais_text = extra_egais.read_text(encoding="utf-8")
+        if egais_text:
+            if not egais_text.endswith("\n"):
+                egais_text += "\n"
+            out.write(egais_text)
 
 print(f"Merged corpus: {merged}")
 PY

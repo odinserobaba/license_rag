@@ -113,6 +113,12 @@ def main() -> None:
         choices=["yandex_openai", "aitunnel_openai"],
         help="Бэкенд генерации (embeddings re-rank по-прежнему через Yandex, если задан ключ)",
     )
+    parser.add_argument(
+        "--answer-mode",
+        default="full",
+        choices=["full", "concise", "user"],
+        help="Режим ответа app.answer",
+    )
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--embeddings-top-n", type=int, default=80)
     parser.add_argument(
@@ -188,7 +194,7 @@ def main() -> None:
         "official_only": not args.full_corpus,
         "multi_step_retrieval": True,
         "use_embeddings_rerank": True,
-        "answer_mode": "full",
+        "answer_mode": args.answer_mode,
         "exclude_topics": sorted(exclude_topics),
         "exclude_ids": sorted(exclude_ids),
         "questions_total": len(rows),
@@ -231,7 +237,7 @@ def main() -> None:
                 enable_logging=False,
                 show_reasoning=True,
                 multi_step_retrieval=True,
-                answer_mode="full",
+                answer_mode=args.answer_mode,
                 aitunnel_api_key=app_module.DEFAULT_AITUNNEL_API_KEY,
                 aitunnel_base_url=app_module.DEFAULT_AITUNNEL_BASE_URL,
                 aitunnel_model=app_module.DEFAULT_AITUNNEL_MODEL,
