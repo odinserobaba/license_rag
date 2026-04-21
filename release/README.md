@@ -12,6 +12,7 @@
 - `FINAL_VERSION_MANIFEST.md` — список файлов репозитория, относящихся к финальной версии.
 - `.env.final.example` — шаблон переменных окружения.
 - `run_final_web.sh` — запуск веба с baseline-параметрами.
+- `deploy/README_RU_DEPLOY.md` — развертывание в РФ (systemd + nginx + API access).
 
 ## Быстрый запуск
 

@@ -4620,9 +4620,14 @@ with gr.Blocks() as demo:
 
 
 if __name__ == "__main__":
+    server_name = os.getenv("WEB_SERVER_NAME", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        server_port = int(os.getenv("WEB_SERVER_PORT", "7860"))
+    except ValueError:
+        server_port = 7860
     demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
+        server_name=server_name,
+        server_port=server_port,
         css=CYBERPUNK_CSS,
         js=CYBERPUNK_JS,
     )
