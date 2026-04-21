@@ -270,6 +270,27 @@ def test_user_mode_adds_required_sections_when_missing():
     assert "### Проверка актуальности норм" in out
 
 
+def test_user_mode_adds_norm_quote_for_article_question():
+    q = "Какие ключевые сведения должны быть в заявлении согласно статье 19 171-ФЗ?"
+    text = "### Краткий ответ\nСведения указываются по закону."
+    match = _mk_match(
+        "Статья 19. Для получения лицензии организация представляет заявление с указанием сведений о заявителе и объекте деятельности.",
+        doc_type="ФЕДЕРАЛЬНЫЙ ЗАКОН",
+        doc_number="171-ФЗ",
+    )
+    out = app.ensure_user_friendly_answer_with_sources(text, [match], q)
+    assert "### Цитата нормы" in out
+    assert "Статья 19" in out
+    assert "Источник цитаты" in out
+
+
+def test_user_mode_skips_norm_quote_for_non_reference_question():
+    q = "Кто выдает лицензию на розничную продажу алкоголя?"
+    text = "### Краткий ответ\nЛицензию выдает уполномоченный орган субъекта РФ."
+    out = app.ensure_user_friendly_answer_with_sources(text, [_mk_match("...")], q)
+    assert "### Цитата нормы" not in out
+
+
 def test_user_mode_equipment_list_action_block_is_not_generic():
     q = "Где закреплён перечень видов основного технологического оборудования для лицензирования?"
     text = "### Краткий ответ\nПеречень установлен приказом №405."

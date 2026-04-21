@@ -180,6 +180,7 @@ WEB_DEFAULT_MULTI_STEP = _env_bool("WEB_DEFAULT_MULTI_STEP", True)
 WEB_DEFAULT_ANSWER_MODE = os.getenv("WEB_DEFAULT_ANSWER_MODE", "full").strip().lower()
 if WEB_DEFAULT_ANSWER_MODE not in {"full", "concise", "user"}:
     WEB_DEFAULT_ANSWER_MODE = "full"
+WEB_DEFAULT_NORM_QUOTE = _env_bool("WEB_DEFAULT_NORM_QUOTE", True)
 
 # Коды видов лицензируемой деятельности (справочник guide_license_activity_codes.md)
 LICENSE_ACTIVITY_CODES: list[tuple[str, str]] = [
@@ -1151,6 +1152,64 @@ def applicant_docs_bullets(question: str) -> list[str]:
     ]
 
 
+def should_add_norm_quote(question: str) -> bool:
+    q = (question or "").lower()
+    if LEGAL_REF_RE.search(q):
+        return True
+    if re.search(r"\b\d{2,5}\s*-\s*фз\b", q, re.IGNORECASE):
+        return True
+    if "171-фз" in q or "99-фз" in q:
+        return True
+    return False
+
+
+def extract_norm_quote_block(question: str, matches: list[tuple[float, dict]]) -> str:
+    if not should_add_norm_quote(question):
+        return ""
+    q_low = (question or "").lower()
+    q_article_nums = [m.group(1) for m in ARTICLE_REF_NUM_RE.finditer(q_low)]
+    q_point_nums = [m.group(1) for m in re.finditer(r"пункт[а-я]*\s+(\d+(?:\.\d+)?)", q_low, re.IGNORECASE)]
+
+    best_text = ""
+    best_meta: dict = {}
+    best_score = -1.0
+    for score, row in matches[:10]:
+        text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
+        if len(text) < 80:
+            continue
+        meta = row.get("metadata", {}) or {}
+        text_low = text.lower()
+        fit = float(score)
+        if LEGAL_REF_RE.search(text_low):
+            fit += 2.0
+        if any(f"стат{suffix} {n}" in text_low for n in q_article_nums for suffix in ("ья", "ье", "ьи")):
+            fit += 3.0
+        if any(f"пункт {n}" in text_low for n in q_point_nums):
+            fit += 3.0
+        doc_type = str(meta.get("doc_type") or "").upper().strip()
+        if doc_type in {"ФЕДЕРАЛЬНЫЙ ЗАКОН", "ПОСТАНОВЛЕНИЕ", "ПРИКАЗ"}:
+            fit += 1.0
+        if fit > best_score:
+            best_score = fit
+            best_text = text
+            best_meta = meta
+    if not best_text:
+        return ""
+
+    quote = best_text[:380].strip()
+    if len(best_text) > 380:
+        quote = quote.rstrip(" ,.;:") + "..."
+
+    source = concise_source_label(best_meta, max_title_len=0)
+    if source:
+        return (
+            "### Цитата нормы\n"
+            f"> {quote}\n\n"
+            f"- Источник цитаты: {source}"
+        )
+    return f"### Цитата нормы\n> {quote}"
+
+
 def ensure_questions_to_applicant_block(answer_text: str, question: str) -> str:
     if "### Что нужно уточнить у заявителя" in answer_text:
         return answer_text
@@ -1550,6 +1609,7 @@ def ensure_user_friendly_answer_with_sources(
     text: str,
     matches: list[tuple[float, dict]],
     question: str,
+    show_norm_quote: bool = True,
 ) -> str:
     def _strip_legacy_template_markdown_sections(text: str) -> str:
         # Remove old fallback-template markdown sections to avoid duplicated/noisy blocks
@@ -1714,6 +1774,10 @@ def ensure_user_friendly_answer_with_sources(
             "### Что нужно уточнить у заявителя\n"
             + "\n".join(applicant_clarification_bullets(question))
         )
+    if show_norm_quote and "### Цитата нормы" not in body:
+        quote_block = extract_norm_quote_block(question, matches)
+        if quote_block:
+            body = f"{body}\n\n{quote_block}"
     if "### Проверка актуальности норм" not in body:
         actuality_lines = [
             "- Сверьте редакцию применимых НПА на дату обращения (включая последние изменения и переходные положения)."
@@ -3470,6 +3534,7 @@ def answer(
     show_reasoning: bool,
     multi_step_retrieval: bool,
     answer_mode: str,
+    show_norm_quote: bool = True,
     aitunnel_api_key: str = "",
     aitunnel_base_url: str = "",
     aitunnel_model: str = "",
@@ -3796,7 +3861,12 @@ def answer(
         main_answer = f"{main_answer}\n\n{official_links_block}"
     main_answer = linkify_legal_references(main_answer)
     if user_mode:
-        main_answer = ensure_user_friendly_answer_with_sources(main_answer, matches, question)
+        main_answer = ensure_user_friendly_answer_with_sources(
+            main_answer,
+            matches,
+            question,
+            show_norm_quote=show_norm_quote,
+        )
     elif concise_mode:
         main_answer = ensure_concise_answer_with_sources(main_answer, matches)
 
@@ -3901,6 +3971,7 @@ def ui_chat_respond(
     show_reasoning: bool,
     multi_step_retrieval: bool,
     answer_mode: str,
+    show_norm_quote: bool,
 ) -> tuple[str, list]:
     user_message = (message or "").strip()
     turns = list(history or [])
@@ -3927,6 +3998,7 @@ def ui_chat_respond(
         show_reasoning,
         multi_step_retrieval,
         answer_mode,
+        show_norm_quote,
         aitunnel_api_key,
         aitunnel_base_url,
         aitunnel_model,
@@ -4525,6 +4597,10 @@ with gr.Blocks() as demo:
                     value=WEB_DEFAULT_ANSWER_MODE,
                     label="Режим ответа",
                 )
+                norm_quote_input = gr.Checkbox(
+                    value=WEB_DEFAULT_NORM_QUOTE,
+                    label="Показывать цитату нормы (для вопросов со статьями/пунктами)",
+                )
 
             with gr.Accordion("Расширенные настройки", open=False):
                 ollama_model_input = gr.Textbox(
@@ -4607,6 +4683,7 @@ with gr.Blocks() as demo:
         show_reasoning_input,
         multi_step_input,
         answer_mode_input,
+        norm_quote_input,
     ]
     submit_outputs = [user_input, chat_history_state]
 

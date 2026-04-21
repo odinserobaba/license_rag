@@ -13,6 +13,7 @@
 - `.env.final.example` — шаблон переменных окружения.
 - `run_final_web.sh` — запуск веба с baseline-параметрами.
 - `deploy/README_RU_DEPLOY.md` — развертывание в РФ (systemd + nginx + API access).
+- `DEPLOY_CHECKLIST.md` — краткий чек-лист для защиты/демо.
 
 ## Быстрый запуск
 
