@@ -284,11 +284,88 @@ def test_user_mode_adds_norm_quote_for_article_question():
     assert "Источник цитаты" in out
 
 
+def test_user_mode_adds_norm_quote_for_number_reference_question():
+    q = "В каких случаях выездная оценка не проводится по постановлению №1720?"
+    text = "### Краткий ответ\nПроверьте исключения по правилам."
+    match = _mk_match(
+        "Пункт 29 Правил: выездная оценка не проводится при досрочном прекращении лицензии и в иных случаях, указанных в правилах.",
+        doc_type="ПОСТАНОВЛЕНИЕ",
+        doc_number="1720",
+    )
+    out = app.ensure_user_friendly_answer_with_sources(text, [match], q)
+    assert "### Цитата нормы" in out
+    assert "Пункт 29" in out
+
+
+def test_user_mode_quote_source_label_is_canonical_for_document_type():
+    q = "Какие сведения должны быть в заявлении по статье 19 171-ФЗ?"
+    text = "### Краткий ответ\nСведения определяются законом."
+    row = (
+        1.0,
+        {
+            "text": "Статья 19. Заявление о выдаче лицензии включает сведения о заявителе и объекте деятельности.",
+            "metadata": {
+                "doc_type": "ДОКУМЕНТ",
+                "doc_number_text": "171-ФЗ",
+                "source_file": "random.txt",
+            },
+        },
+    )
+    out = app.ensure_user_friendly_answer_with_sources(text, [row], q)
+    assert "Источник цитаты: Федеральный закон №171-ФЗ" in out
+    assert "Источник цитаты: ДОКУМЕНТ" not in out
+
+
+def test_user_mode_quote_filters_consultant_metadata_noise():
+    q = "Как соотносятся 99-ФЗ и 171-ФЗ?"
+    text = "### Краткий ответ\nПрименяется специальная норма 171-ФЗ."
+    match = _mk_match(
+        "Документ предоставлен КонсультантПлюс www.consultant.ru Дата сохранения: 02.04.2024 "
+        "Федеральный закон от 22.11.1995 N 171-ФЗ определяет специальное регулирование.",
+        doc_type="ФЕДЕРАЛЬНЫЙ ЗАКОН",
+        doc_number="171-ФЗ",
+    )
+    out = app.ensure_user_friendly_answer_with_sources(text, [match], q)
+    assert "КонсультантПлюс" not in out
+    assert "Дата сохранения" not in out
+    assert "www.consultant.ru" not in out
+
+
 def test_user_mode_skips_norm_quote_for_non_reference_question():
     q = "Кто выдает лицензию на розничную продажу алкоголя?"
     text = "### Краткий ответ\nЛицензию выдает уполномоченный орган субъекта РФ."
     out = app.ensure_user_friendly_answer_with_sources(text, [_mk_match("...")], q)
     assert "### Цитата нормы" not in out
+
+
+def test_user_mode_retail_action_block_is_contextual():
+    q = "Какой орган компетентен выдавать лицензию на розничную продажу алкогольной продукции?"
+    text = "### Краткий ответ\nЛицензию выдает уполномоченный орган субъекта РФ."
+    out = app.ensure_user_friendly_answer_with_sources(text, [_mk_match("...")], q)
+    assert "уполномоченный орган субъекта РФ" in out or "уполномоченный орган субъекта рф" in out.lower()
+
+
+def test_user_mode_clarification_fixation_is_contextual():
+    q = "Какие требования к средствам автоматической фиксации движения при лицензировании?"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nТребования установлены профильными приказами.", [_mk_match("...")], q)
+    low = out.lower()
+    assert "глонасс" in low or "gps" in low
+    assert "егаис" in low
+
+
+def test_user_mode_clarification_sources_of_funds_is_contextual():
+    q = "Какими документами подтверждаются источники происхождения денежных средств для уставного капитала?"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nНужно подтвердить происхождение средств.", [_mk_match("...")], q)
+    low = out.lower()
+    assert "банк" in low
+    assert "период" in low
+
+
+def test_user_mode_clarification_99_vs_171_mentions_collision():
+    q = "Как соотносятся 99-ФЗ и 171-ФЗ?"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\n171-ФЗ — специальный закон.", [_mk_match("...")], q)
+    low = out.lower()
+    assert "коллиз" in low
 
 
 def test_user_mode_equipment_list_action_block_is_not_generic():

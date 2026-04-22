@@ -8,6 +8,56 @@ from html import unescape
 from pathlib import Path
 
 
+MONTHS = {
+    "января": "01",
+    "февраля": "02",
+    "марта": "03",
+    "апреля": "04",
+    "мая": "05",
+    "июня": "06",
+    "июля": "07",
+    "августа": "08",
+    "сентября": "09",
+    "октября": "10",
+    "ноября": "11",
+    "декабря": "12",
+}
+
+
+def detect_source_bucket(source_rel_path: str) -> str:
+    p = (source_rel_path or "").replace("\\", "/").lower()
+    if "/new_doc/" in f"/{p}":
+        return "new_doc"
+    return "doc"
+
+
+def normalize_date(raw: str | None) -> str | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{2})[._-](\d{2})[._-](\d{4})$", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    m = re.match(r"^(\d{1,2})\s+([А-Яа-я]+)\s+(\d{4})\s*г?\.?$", s)
+    if m:
+        day, month_ru, year = m.group(1), m.group(2).lower(), m.group(3)
+        month = MONTHS.get(month_ru)
+        if month:
+            return f"{int(day):02d}.{month}.{year}"
+    return None
+
+
+def extract_date_from_text(text: str) -> str | None:
+    header = (text or "")[:2500]
+    m = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b", header)
+    if m:
+        return normalize_date(m.group(1))
+    m = re.search(r"\b(\d{1,2}\s+[А-Яа-я]+\s+\d{4}\s*г?\.?)\b", header)
+    if m:
+        return normalize_date(m.group(1))
+    return None
+
+
 def build_doc_citation(meta: dict) -> str:
     doc_type = (meta.get("doc_type") or "Документ").strip()
     number = meta.get("doc_number_text") or meta.get("doc_number_file")
@@ -59,10 +109,10 @@ def html_to_clean_text(html: str) -> str:
     return text
 
 
-def extract_metadata(file_name: str, text: str) -> dict:
-    file_match = re.match(r"norm_(\d+)_(\d{2}_\d{2}_\d{4})\.rtf$", file_name)
+def extract_metadata(file_name: str, source_rel_path: str, text: str) -> dict:
+    file_match = re.match(r"norm_([0-9a-zA-Zа-яА-Я\-]+)_(\d{2}_\d{2}_\d{4})(?:_v\d+)?\.rtf$", file_name)
     doc_number_file = file_match.group(1) if file_match else None
-    doc_date_file = file_match.group(2).replace("_", ".") if file_match else None
+    doc_date_file = normalize_date(file_match.group(2)) if file_match else None
 
     # Header metadata from text for better grounding in answers
     doc_type_match = re.search(r"\b(ПРИКАЗ|ПОСТАНОВЛЕНИЕ|РАСПОРЯЖЕНИЕ|ФЕДЕРАЛЬНЫЙ\s+ЗАКОН)\b", text)
@@ -86,6 +136,8 @@ def extract_metadata(file_name: str, text: str) -> dict:
         )
     if number_match:
         doc_number_text = number_match.group(1)
+    doc_date_text = extract_date_from_text(text)
+    doc_date_effective = doc_date_file or doc_date_text
 
     title = None
     title_match = re.search(r"(Об\s+утверждении[^\n]{20,500}|О\s+государственном[^\n]{20,500})", text)
@@ -94,9 +146,13 @@ def extract_metadata(file_name: str, text: str) -> dict:
 
     return {
         "source_file": file_name,
+        "source_rel_path": source_rel_path,
+        "source_bucket": detect_source_bucket(source_rel_path),
         "doc_type": doc_type,
         "doc_number_file": doc_number_file,
         "doc_date_file": doc_date_file,
+        "doc_date_text": doc_date_text,
+        "doc_date_effective": doc_date_effective,
         "doc_number_text": doc_number_text,
         "title_guess": title,
         "doc_title": title,
@@ -104,7 +160,7 @@ def extract_metadata(file_name: str, text: str) -> dict:
             {
                 "doc_type": doc_type,
                 "doc_number_file": doc_number_file,
-                "doc_date_file": doc_date_file,
+                "doc_date_file": doc_date_effective,
                 "doc_number_text": doc_number_text,
                 "title_guess": title,
             }
@@ -112,11 +168,12 @@ def extract_metadata(file_name: str, text: str) -> dict:
     }
 
 
-def process_file(path: Path) -> tuple[dict, str]:
+def process_file(path: Path, input_dir: Path) -> tuple[dict, str]:
     raw = path.read_bytes()
     html = extract_html_from_mhtml(raw)
     clean_text = html_to_clean_text(html)
-    meta = extract_metadata(path.name, clean_text)
+    source_rel_path = str(path.relative_to(input_dir))
+    meta = extract_metadata(path.name, source_rel_path, clean_text)
     return meta, clean_text
 
 
@@ -133,13 +190,13 @@ def main() -> None:
     txt_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(input_dir.glob("*.rtf"))
+    files = sorted(input_dir.rglob("*.rtf"))
     if not files:
         raise SystemExit(f"No .rtf files found in {input_dir}")
 
     records = []
     for path in files:
-        meta, clean_text = process_file(path)
+        meta, clean_text = process_file(path, input_dir)
         txt_path = txt_dir / f"{path.stem}.txt"
         txt_path.write_text(clean_text, encoding="utf-8")
         record = {"id": path.stem, "metadata": meta, "text": clean_text}

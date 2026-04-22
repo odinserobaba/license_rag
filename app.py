@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time
 import hashlib
 from collections import Counter, deque
@@ -150,6 +151,7 @@ DEFAULT_LORA_ADAPTER_PATH = os.getenv("LOCAL_LORA_ADAPTER_PATH", "")
 LOG_PATH = Path("processed/chat_logs.jsonl")
 QA_LOG_PATH = Path("processed/qa_history.jsonl")
 EMBEDDING_CACHE_PATH = Path("processed/embedding_cache.json")
+ANSWER_CACHE_PATH = Path("processed/answer_cache.sqlite")
 DEFAULT_YANDEX_EMBEDDING_MODEL = os.getenv(
     "YANDEX_EMBEDDING_MODEL",
     "text-search-query/latest",
@@ -181,6 +183,12 @@ WEB_DEFAULT_ANSWER_MODE = os.getenv("WEB_DEFAULT_ANSWER_MODE", "full").strip().l
 if WEB_DEFAULT_ANSWER_MODE not in {"full", "concise", "user"}:
     WEB_DEFAULT_ANSWER_MODE = "full"
 WEB_DEFAULT_NORM_QUOTE = _env_bool("WEB_DEFAULT_NORM_QUOTE", True)
+ANSWER_CACHE_ENABLED = _env_bool("ANSWER_CACHE_ENABLED", True)
+ANSWER_CACHE_TTL_SEC = max(60, int(os.getenv("ANSWER_CACHE_TTL_SEC", str(7 * 24 * 3600))))
+ANSWER_CACHE_MAX_ENTRIES = max(200, int(os.getenv("ANSWER_CACHE_MAX_ENTRIES", "5000")))
+RETRIEVAL_CACHE_ENABLED = _env_bool("RETRIEVAL_CACHE_ENABLED", True)
+RETRIEVAL_CACHE_TTL_SEC = max(60, int(os.getenv("RETRIEVAL_CACHE_TTL_SEC", str(3 * 24 * 3600))))
+RETRIEVAL_CACHE_MAX_ENTRIES = max(200, int(os.getenv("RETRIEVAL_CACHE_MAX_ENTRIES", "10000")))
 
 # Коды видов лицензируемой деятельности (справочник guide_license_activity_codes.md)
 LICENSE_ACTIVITY_CODES: list[tuple[str, str]] = [
@@ -597,7 +605,17 @@ def load_index() -> dict:
         return json.load(f)
 
 
+def compute_index_fingerprint() -> str:
+    """Cheap fingerprint to invalidate caches after index rebuilds."""
+    try:
+        st = INDEX_PATH.stat()
+        return f"{int(st.st_mtime)}:{st.st_size}"
+    except Exception:
+        return "no_index"
+
+
 INDEX = load_index()
+INDEX_FINGERPRINT = compute_index_fingerprint()
 
 
 def doc_label(meta: dict) -> str:
@@ -933,6 +951,18 @@ def build_field_assessment_details_block(question: str, matches: list[tuple[floa
 def applicant_clarification_bullets(question: str) -> list[str]:
     """Вопросы заявителю по смыслу запроса (без универсального транспортного чеклиста)."""
     q = (question or "").lower().replace("лоценз", "лиценз")
+    if ("фиксац" in q and "движен" in q) or ("средств" in q and "397" in q):
+        return [
+            "- Тип транспорта: собственный/арендованный, количество ТС и маршруты перевозок.",
+            "- Наличие и модель ГЛОНАСС/GPS-терминала, периодичность передачи навигационных данных.",
+            "- Настроен ли контроллер передачи сведений в ЕГАИС и выполнено ли опломбирование оборудования.",
+        ]
+    if ("источник" in q or "происхожд" in q or "денеж" in q) and ("устав" in q or "капитал" in q):
+        return [
+            "- Кто вносил средства (физлицо/юрлицо), и какая сумма подтверждается по каждому платежу.",
+            "- За какой период представлены финансовые документы для подтверждения происхождения средств.",
+            "- Банк-эмитент платежных документов и реквизиты счетов, по которым подтверждается зачисление.",
+        ]
     if is_transport_ethanol_query(question):
         out = [
             "- Тип продукции: этиловый спирт или нефасованная спиртосодержащая продукция (>25%).",
@@ -980,6 +1010,7 @@ def applicant_clarification_bullets(question: str) -> list[str]:
     if "99" in q and "171" in q:
         return [
             "- Какая деятельность в фокусе: спирт/алкогольный рынок по 171-ФЗ или общее регулирование АП по 99-ФЗ.",
+            "- Есть ли в вашем кейсе коллизия между общей и специальной нормой (что именно вызывает спор).",
             "- Нужно сравнение предметов законов или конкретная процедура по заявлению.",
         ]
     if "рознич" in q or "розниц" in q:
@@ -1003,6 +1034,12 @@ def applicant_clarification_bullets(question: str) -> list[str]:
 
 def applicant_action_bullets(question: str) -> list[str]:
     q = (question or "").lower()
+    if is_retail_license_authority_query(question):
+        return [
+            "- Определить субъект РФ, уполномоченный орган которого выдает розничную лицензию по адресу объекта.",
+            "- Проверить региональный порядок подачи и комплект документов для соответствующего субъекта РФ.",
+            "- Подать заявление в уполномоченный орган субъекта РФ и контролировать статус обращения.",
+        ]
     if ("переч" in q and "оборудован" in q) or ("вид" in q and "оборудован" in q):
         return [
             "- Открыть актуальную редакцию Приказа №405 и сверить применимость к вашему виду деятельности.",
@@ -1156,6 +1193,8 @@ def should_add_norm_quote(question: str) -> bool:
     q = (question or "").lower()
     if LEGAL_REF_RE.search(q):
         return True
+    if LEGAL_NUMBER_RE.search(q):
+        return True
     if re.search(r"\b\d{2,5}\s*-\s*фз\b", q, re.IGNORECASE):
         return True
     if "171-фз" in q or "99-фз" in q:
@@ -1196,11 +1235,28 @@ def extract_norm_quote_block(question: str, matches: list[tuple[float, dict]]) -
     if not best_text:
         return ""
 
-    quote = best_text[:380].strip()
+    # Remove service overlays from legal portals before showing quote.
+    quote = re.sub(r"Документ\s+предоставлен\s+КонсультантПлюс.*?(?=Федеральный\s+закон|$)", " ", best_text, flags=re.IGNORECASE)
+    quote = re.sub(r"www\.consultant\.ru", " ", quote, flags=re.IGNORECASE)
+    quote = re.sub(r"Дата\s+сохранения:\s*\d{2}\.\d{2}\.\d{4}", " ", quote, flags=re.IGNORECASE)
+    quote = re.sub(r"\s+", " ", quote).strip()
+    quote = quote[:380].strip()
     if len(best_text) > 380:
         quote = quote.rstrip(" ,.;:") + "..."
 
-    source = concise_source_label(best_meta, max_title_len=0)
+    doc_type = str(best_meta.get("doc_type") or "").strip().upper()
+    doc_no = _normalize_doc_no(str(best_meta.get("doc_number_text") or best_meta.get("doc_number_file") or ""))
+    source = DOC_LABEL_EXACT.get((doc_type, doc_no), "")
+    if not source and doc_no:
+        if doc_no.endswith("-ФЗ"):
+            source = DOC_LABEL_EXACT.get(("ФЕДЕРАЛЬНЫЙ ЗАКОН", doc_no), "")
+        if not source:
+            for dt in ("ПОСТАНОВЛЕНИЕ", "ПРИКАЗ", "РАСПОРЯЖЕНИЕ"):
+                source = DOC_LABEL_EXACT.get((dt, doc_no), "")
+                if source:
+                    break
+    if not source:
+        source = concise_source_label(best_meta, max_title_len=0)
     if source:
         return (
             "### Цитата нормы\n"
@@ -1801,6 +1857,210 @@ def append_qa_log(record: dict) -> None:
     QA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with QA_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _answer_cache_init(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answer_cache (
+            cache_key TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            index_fingerprint TEXT NOT NULL,
+            answer_text TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_answer_cache_created_at ON answer_cache(created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS retrieval_cache (
+            cache_key TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            index_fingerprint TEXT NOT NULL,
+            matches_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_cache_created_at ON retrieval_cache(created_at)"
+    )
+
+
+def _answer_cache_make_key(payload: dict) -> str:
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _answer_cache_get(cache_key: str, ttl_sec: int) -> str | None:
+    if not ANSWER_CACHE_ENABLED:
+        return None
+    if not cache_key:
+        return None
+    if not ANSWER_CACHE_PATH.exists():
+        return None
+    now_ts = int(time.time())
+    min_ts = now_ts - max(60, int(ttl_sec))
+    try:
+        with sqlite3.connect(str(ANSWER_CACHE_PATH)) as conn:
+            _answer_cache_init(conn)
+            row = conn.execute(
+                """
+                SELECT answer_text
+                FROM answer_cache
+                WHERE cache_key = ?
+                  AND index_fingerprint = ?
+                  AND created_at >= ?
+                """,
+                (cache_key, INDEX_FINGERPRINT, min_ts),
+            ).fetchone()
+            return str(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _answer_cache_put(cache_key: str, answer_text: str) -> None:
+    if not ANSWER_CACHE_ENABLED:
+        return
+    if not cache_key or not answer_text:
+        return
+    try:
+        ANSWER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        now_ts = int(time.time())
+        with sqlite3.connect(str(ANSWER_CACHE_PATH)) as conn:
+            _answer_cache_init(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO answer_cache(cache_key, created_at, index_fingerprint, answer_text)
+                VALUES(?, ?, ?, ?)
+                """,
+                (cache_key, now_ts, INDEX_FINGERPRINT, answer_text),
+            )
+            # Keep cache bounded; remove oldest entries beyond limit.
+            conn.execute(
+                """
+                DELETE FROM answer_cache
+                WHERE cache_key IN (
+                    SELECT cache_key
+                    FROM answer_cache
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (ANSWER_CACHE_MAX_ENTRIES,),
+            )
+            conn.commit()
+    except Exception:
+        return
+
+
+def _should_skip_answer_cache(result_text: str, use_llm: bool, llm_error: str) -> bool:
+    if not result_text or not result_text.strip():
+        return True
+    if llm_error:
+        return True
+    # Do not persist temporary degradation responses.
+    if "Сервис генерации временно недоступен" in result_text:
+        return True
+    # Avoid caching explicit technical failures.
+    if use_llm and ("**Техническая деталь:**" in result_text):
+        return True
+    return False
+
+
+def _retrieval_cache_make_key(payload: dict) -> str:
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _serialize_matches(matches: list[tuple[float, dict]]) -> str:
+    rows = [{"score": float(score), "row": row} for score, row in matches]
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _deserialize_matches(blob: str) -> list[tuple[float, dict]]:
+    try:
+        rows = json.loads(blob)
+    except Exception:
+        return []
+    out: list[tuple[float, dict]] = []
+    if not isinstance(rows, list):
+        return out
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        score = float(item.get("score") or 0.0)
+        row = item.get("row")
+        if isinstance(row, dict):
+            # deep copy to prevent accidental mutation of cached object
+            row_copy = json.loads(json.dumps(row, ensure_ascii=False))
+            out.append((score, row_copy))
+    return out
+
+
+def _retrieval_cache_get(cache_key: str, ttl_sec: int) -> list[tuple[float, dict]] | None:
+    if not RETRIEVAL_CACHE_ENABLED:
+        return None
+    if not cache_key:
+        return None
+    if not ANSWER_CACHE_PATH.exists():
+        return None
+    now_ts = int(time.time())
+    min_ts = now_ts - max(60, int(ttl_sec))
+    try:
+        with sqlite3.connect(str(ANSWER_CACHE_PATH)) as conn:
+            _answer_cache_init(conn)
+            row = conn.execute(
+                """
+                SELECT matches_json
+                FROM retrieval_cache
+                WHERE cache_key = ?
+                  AND index_fingerprint = ?
+                  AND created_at >= ?
+                """,
+                (cache_key, INDEX_FINGERPRINT, min_ts),
+            ).fetchone()
+            if not row:
+                return None
+            data = _deserialize_matches(str(row[0]))
+            return data if data else None
+    except Exception:
+        return None
+
+
+def _retrieval_cache_put(cache_key: str, matches: list[tuple[float, dict]]) -> None:
+    if not RETRIEVAL_CACHE_ENABLED:
+        return
+    if not cache_key or not matches:
+        return
+    try:
+        ANSWER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        now_ts = int(time.time())
+        with sqlite3.connect(str(ANSWER_CACHE_PATH)) as conn:
+            _answer_cache_init(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO retrieval_cache(cache_key, created_at, index_fingerprint, matches_json)
+                VALUES(?, ?, ?, ?)
+                """,
+                (cache_key, now_ts, INDEX_FINGERPRINT, _serialize_matches(matches)),
+            )
+            conn.execute(
+                """
+                DELETE FROM retrieval_cache
+                WHERE cache_key IN (
+                    SELECT cache_key
+                    FROM retrieval_cache
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (RETRIEVAL_CACHE_MAX_ENTRIES,),
+            )
+            conn.commit()
+    except Exception:
+        return
 
 
 _EMBEDDING_CACHE_MEM: dict[str, dict[str, list[float]]] | None = None
@@ -3556,25 +3816,100 @@ def answer(
         mode = "full"
     concise_mode = mode in {"concise", "user"}
     user_mode = mode == "user"
-    retrieval_boost = expand_query_for_activity_codes(question)
-    scored = score_query(
-        question,
-        INDEX,
-        official_only=official_only,
-        retrieval_text=retrieval_boost,
-    )
+    cache_payload = {
+        "question": question,
+        "mode": mode,
+        "top_k": int(top_k),
+        "official_only": bool(official_only),
+        "use_embeddings_rerank": bool(use_embeddings_rerank),
+        "embeddings_top_n": int(embeddings_top_n),
+        "use_llm": bool(use_llm),
+        "llm_backend": str(llm_backend or ""),
+        "llm_model": str(llm_model or ""),
+        "lora_base_model": str(lora_base_model or ""),
+        "lora_adapter_path": str(lora_adapter_path or ""),
+        "yandex_model": str(yandex_model or ""),
+        "yandex_embedding_model": str(yandex_embedding_model or ""),
+        "aitunnel_model": str(aitunnel_model or ""),
+        "show_reasoning": bool(show_reasoning),
+        "multi_step_retrieval": bool(multi_step_retrieval),
+        "show_norm_quote": bool(show_norm_quote),
+        "index_fingerprint": INDEX_FINGERPRINT,
+    }
+    cache_key = _answer_cache_make_key(cache_payload)
+    cached_result = _answer_cache_get(cache_key, ANSWER_CACHE_TTL_SEC)
+    if cached_result is not None:
+        qa_record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "question": question,
+            "answer": cached_result,
+            "backend": f"{llm_backend if use_llm else 'template_only'}_cache",
+            "model": (yandex_model if llm_backend == "yandex_openai" else llm_model),
+            "top_k": top_k,
+            "official_only": official_only,
+            "use_embeddings_rerank": bool(use_embeddings_rerank),
+            "embeddings_top_n": int(embeddings_top_n),
+            "embedding_model": (yandex_embedding_model or "").strip(),
+            "embedding_diag": {"cache_hit": True},
+            "multi_step_retrieval": multi_step_retrieval,
+            "answer_mode": mode,
+            "blocked_tags": blocked_tags,
+            "critical_guard_notes": ["answer_cache_hit"],
+            "suspicious_doc_numbers": [],
+        }
+        append_qa_log(qa_record)
+        if enable_logging:
+            append_log(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "question": question,
+                    "backend": f"{llm_backend if use_llm else 'template_only'}_cache",
+                    "model": yandex_model if llm_backend == "yandex_openai" else llm_model,
+                    "answer_mode": mode,
+                    "cache_hit": True,
+                    "response_preview": cached_result[:800],
+                }
+            )
+        return cached_result
+    retrieval_cache_payload = {
+        "question": question,
+        "top_k": int(top_k),
+        "official_only": bool(official_only),
+        "use_embeddings_rerank": bool(use_embeddings_rerank),
+        "embeddings_top_n": int(embeddings_top_n),
+        "multi_step_retrieval": bool(multi_step_retrieval),
+        "index_fingerprint": INDEX_FINGERPRINT,
+    }
+    retrieval_cache_key = _retrieval_cache_make_key(retrieval_cache_payload)
     embedding_diag: dict = {"enabled": bool(use_embeddings_rerank), "used": False}
-    if use_embeddings_rerank:
-        scored, embedding_diag = rerank_with_embeddings(
+    retrieval_cache_hit = False
+    cached_matches = _retrieval_cache_get(retrieval_cache_key, RETRIEVAL_CACHE_TTL_SEC)
+    if cached_matches is not None:
+        matches = cached_matches
+        scored: list[tuple[float, dict]] = list(cached_matches)
+        retrieval_cache_hit = True
+        embedding_diag["cache_hit"] = True
+    else:
+        retrieval_boost = expand_query_for_activity_codes(question)
+        scored = score_query(
             question,
-            scored,
-            api_key=(yandex_api_key or "").strip(),
-            folder=(yandex_folder or "").strip(),
-            model=(yandex_embedding_model or "").strip(),
-            top_n=embeddings_top_n,
+            INDEX,
+            official_only=official_only,
+            retrieval_text=retrieval_boost,
         )
-    matches = select_diverse_matches(scored, top_k)
-    matches = expand_matches_parent_child(scored, matches, INDEX, official_only, top_k=top_k, question=question)
+        if use_embeddings_rerank:
+            scored, embedding_diag = rerank_with_embeddings(
+                question,
+                scored,
+                api_key=(yandex_api_key or "").strip(),
+                folder=(yandex_folder or "").strip(),
+                model=(yandex_embedding_model or "").strip(),
+                top_n=embeddings_top_n,
+            )
+        matches = select_diverse_matches(scored, top_k)
+        matches = expand_matches_parent_child(scored, matches, INDEX, official_only, top_k=top_k, question=question)
+        if matches:
+            _retrieval_cache_put(retrieval_cache_key, matches)
     if not matches:
         return (
             "Не нашел релевантные фрагменты в локальной базе.\n\n"
@@ -3917,6 +4252,7 @@ def answer(
         "blocked_tags": blocked_tags,
         "critical_guard_notes": critical_guard_notes,
         "suspicious_doc_numbers": hallucinated_nums,
+        "retrieval_cache_hit": retrieval_cache_hit,
     }
     append_qa_log(qa_record)
 
@@ -3939,12 +4275,15 @@ def answer(
             "blocked_tags": blocked_tags,
             "critical_guard_notes": critical_guard_notes,
             "suspicious_doc_numbers": hallucinated_nums,
+            "retrieval_cache_hit": retrieval_cache_hit,
             "prompt": prompt,
             "response_preview": main_answer[:800],
             "reasoning_preview": llm_reasoning[:500],
             "validation": validation,
         }
         append_log(record)
+    if not _should_skip_answer_cache(result, use_llm=use_llm, llm_error=llm_error):
+        _answer_cache_put(cache_key, result)
     return result
 
 

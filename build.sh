@@ -32,32 +32,12 @@ echo "[5/7] Prepare DOC/DOCX corpus (if any)"
   --jsonl processed/extra_docs.jsonl
 
 echo "[6/7] Merge corpora and chunk"
-".venv/bin/python" - <<'PY'
-from pathlib import Path
-
-rtf = Path("processed/cleaned_docs_rtf.jsonl")
-extra = Path("processed/extra_docs.jsonl")
-extra_egais = Path("processed/extra_docs_egais_centerinform.jsonl")
-merged = Path("processed/cleaned_docs.jsonl")
-
-with merged.open("w", encoding="utf-8") as out:
-    if rtf.exists():
-        out.write(rtf.read_text(encoding="utf-8"))
-    if extra.exists():
-        extra_text = extra.read_text(encoding="utf-8")
-        if extra_text:
-            if not extra_text.endswith("\n"):
-                extra_text += "\n"
-            out.write(extra_text)
-    if extra_egais.exists():
-        egais_text = extra_egais.read_text(encoding="utf-8")
-        if egais_text:
-            if not egais_text.endswith("\n"):
-                egais_text += "\n"
-            out.write(egais_text)
-
-print(f"Merged corpus: {merged}")
-PY
+".venv/bin/python" scripts/merge_corpora.py \
+  --rtf-jsonl processed/cleaned_docs_rtf.jsonl \
+  --extra-jsonl processed/extra_docs.jsonl \
+  --extra-egais-jsonl processed/extra_docs_egais_centerinform.jsonl \
+  --output-jsonl processed/cleaned_docs.jsonl \
+  --new-doc-report processed/new_doc_presence_report.jsonl
 
 ".venv/bin/python" scripts/chunk_corpus.py \
   --input-jsonl processed/cleaned_docs.jsonl \

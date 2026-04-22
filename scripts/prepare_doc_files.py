@@ -23,6 +23,20 @@ HEADING_RE = re.compile(
     r")(?:[.\s:-].*)?$",
     re.IGNORECASE,
 )
+MONTHS = {
+    "января": "01",
+    "февраля": "02",
+    "марта": "03",
+    "апреля": "04",
+    "мая": "05",
+    "июня": "06",
+    "июля": "07",
+    "августа": "08",
+    "сентября": "09",
+    "октября": "10",
+    "ноября": "11",
+    "декабря": "12",
+}
 
 
 def build_doc_citation(meta: dict) -> str:
@@ -47,6 +61,40 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\n[ \t]+", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def detect_source_bucket(source_rel_path: str) -> str:
+    p = (source_rel_path or "").replace("\\", "/").lower()
+    if "/new_doc/" in f"/{p}":
+        return "new_doc"
+    return "doc"
+
+
+def normalize_date(raw: str | None) -> str | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{2})[._-](\d{2})[._-](\d{4})$", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    m = re.match(r"^(\d{1,2})\s+([А-Яа-я]+)\s+(\d{4})\s*г?\.?$", s)
+    if m:
+        day, month_ru, year = m.group(1), m.group(2).lower(), m.group(3)
+        month = MONTHS.get(month_ru)
+        if month:
+            return f"{int(day):02d}.{month}.{year}"
+    return None
+
+
+def extract_date_from_text(text: str) -> str | None:
+    header = (text or "")[:2500]
+    m = DOC_DATE_RE.search(header)
+    if m:
+        return normalize_date(m.group(1))
+    m = re.search(r"\b(\d{1,2}\s+[А-Яа-я]+\s+\d{4}\s*г?\.?)\b", header)
+    if m:
+        return normalize_date(m.group(1))
+    return None
 
 
 def extract_docx_text(path: Path) -> str:
@@ -302,16 +350,16 @@ def main() -> None:
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     files = sorted(
-        list(input_dir.glob("*.doc"))
-        + list(input_dir.glob("*.DOC"))
-        + list(input_dir.glob("*.docx"))
-        + list(input_dir.glob("*.DOCX"))
-        + list(input_dir.glob("*.txt"))
-        + list(input_dir.glob("*.TXT"))
-        + list(input_dir.glob("*.md"))
-        + list(input_dir.glob("*.MD"))
-        + list(input_dir.glob("*.pdf"))
-        + list(input_dir.glob("*.PDF"))
+        list(input_dir.rglob("*.doc"))
+        + list(input_dir.rglob("*.DOC"))
+        + list(input_dir.rglob("*.docx"))
+        + list(input_dir.rglob("*.DOCX"))
+        + list(input_dir.rglob("*.txt"))
+        + list(input_dir.rglob("*.TXT"))
+        + list(input_dir.rglob("*.md"))
+        + list(input_dir.rglob("*.MD"))
+        + list(input_dir.rglob("*.pdf"))
+        + list(input_dir.rglob("*.PDF"))
     )
     if not files:
         out_jsonl.write_text("", encoding="utf-8")
@@ -322,6 +370,8 @@ def main() -> None:
     records = []
     skipped: list[str] = []
     for path in files:
+        source_rel_path = str(path.relative_to(input_dir))
+        source_bucket = detect_source_bucket(source_rel_path)
         suffix = path.suffix.lower()
         if suffix == ".docx":
             text = extract_docx_text(path)
@@ -341,11 +391,16 @@ def main() -> None:
 
                 number_match = DOC_NUMBER_RE.search(sec_text[:2500])
                 date_match = DOC_DATE_RE.search(sec_text[:2500])
+                doc_date_text = extract_date_from_text(sec_text)
                 meta = {
                     "source_file": path.name,
+                    "source_rel_path": source_rel_path,
+                    "source_bucket": source_bucket,
                     "doc_type": infer_doc_type(sec_text),
                     "doc_number_file": None,
-                    "doc_date_file": date_match.group(1) if date_match else None,
+                    "doc_date_file": normalize_date(date_match.group(1) if date_match else None),
+                    "doc_date_text": doc_date_text,
+                    "doc_date_effective": normalize_date(date_match.group(1) if date_match else None) or doc_date_text,
                     "doc_number_text": number_match.group(1) if number_match else None,
                     "title_guess": sec_title,
                     "doc_title": sec_title,
@@ -381,11 +436,16 @@ def main() -> None:
 
             number_match = DOC_NUMBER_RE.search(sec_text[:2000])
             date_match = DOC_DATE_RE.search(sec_text[:2000])
+            doc_date_text = extract_date_from_text(sec_text)
             meta = {
                 "source_file": path.name,
+                "source_rel_path": source_rel_path,
+                "source_bucket": source_bucket,
                 "doc_type": infer_doc_type(sec_text),
                 "doc_number_file": None,
-                "doc_date_file": date_match.group(1) if date_match else None,
+                "doc_date_file": normalize_date(date_match.group(1) if date_match else None),
+                "doc_date_text": doc_date_text,
+                "doc_date_effective": normalize_date(date_match.group(1) if date_match else None) or doc_date_text,
                 "doc_number_text": number_match.group(1) if number_match else None,
                 "title_guess": sec_title if sec_title != "Основной текст" else None,
                 "doc_title": sec_title if sec_title != "Основной текст" else None,
