@@ -1,0 +1,28 @@
+# Python cache / venv
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.bak
+
+# Project artifacts
+processed/
+!processed/.gitkeep
+doc/rename_map*.tsv
+*.log
+
+# Local models and heavy assets
+models/
+chroma_db/
+
+# Jupyter / pytest / local caches
+.ipynb_checkpoints/
+.pytest_cache/
