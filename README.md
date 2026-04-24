@@ -255,3 +255,114 @@ chmod +x release/build_final_github_package.sh
 - `release/FINAL_SCHEMA_YANDEXGPT5LITE.md`
 - `release/CORPUS_RETRIEVAL_PIPELINE.md`
 - `release/FINAL_VERSION_MANIFEST.md`
+
+---
+
+## 12. Техническая реализация по шагам (подробно)
+
+Ниже описан полный путь: от документов до финального ответа пользователю.
+
+### 12.1 Offline build: как собирается корпус и индекс
+
+1. **Импорт и очистка источников**
+   - Скрипты: `scripts/prepare_corpus.py`, `scripts/prepare_doc_files.py`.
+   - Что делаем: читаем RTF/MHTML/DOC/DOCX/TXT/MD/PDF, нормализуем текст, очищаем шум.
+   - Результат: `processed/cleaned_docs.jsonl`.
+
+2. **Юридический чанкинг**
+   - Скрипт: `scripts/chunk_corpus.py`.
+   - Библиотеки: `re`, `json`, `typing`, `pathlib`.
+   - Что делаем:
+     - выделяем главы/статьи/подпункты регулярными выражениями;
+     - режем текст на семантические блоки без разрушения списков;
+     - добавляем метаданные: `article_number`, `subpoint_refs`, `cited_article_refs`, `norm_refs`, соседние чанки.
+   - Результат: `processed/chunks.jsonl`.
+
+3. **Построение lexical индекса (TF-IDF)**
+   - Скрипт: `scripts/build_index.py`.
+   - Библиотеки: `collections.Counter`, `defaultdict`, `math`, `hashlib`, `json`, `re`.
+   - Что делаем:
+     - токенизируем каждый чанк;
+     - считаем TF по чанку и DF по корпусу;
+     - считаем IDF по формуле `log((N+1)/(df+1))+1`;
+     - сохраняем индекс в JSON.
+   - Результат: `processed/lexical_index.json`.
+
+### 12.2 Online runtime: как обрабатывается вопрос пользователя
+
+1. **Вход в `app.answer()`**
+   - Нормализация вопроса и базовая защита от вредоносных инструкций.
+   - Инициализация параметров retrieval (`top_k`, `official_only`, `multi_step`).
+
+2. **Lexical retrieval (`score_query`)**
+   - Источник: `processed/lexical_index.json`.
+   - Что делаем:
+     - считаем lexical score по пересечению токенов вопроса и чанка;
+     - применяем юридические бусты по norm refs и intent.
+   - Результат: первичный список кандидатов.
+
+3. **Embeddings re-rank (`rerank_with_embeddings`)**
+   - Что делаем:
+     - берем top-N lexical кандидатов;
+     - считаем embedding вопроса и кандидатов;
+     - пересортировываем по семантической близости.
+   - Кэш: `processed/embedding_cache.json`.
+   - Fallback: при недоступности embeddings API используем lexical-only режим.
+
+4. **Multi-step retrieval**
+   - Что делаем:
+     - генерируем follow-up подзапросы по первичному контексту;
+     - повторно ищем по индексу;
+     - объединяем и дедуплицируем результаты (`merge_scored_matches`).
+
+5. **Иерархическое расширение контекста**
+   - Что делаем:
+     - добавляем parent/child и соседние части норм;
+     - при включении выполняем post-expansion rerank.
+   - Цель: сохранить юридическую целостность ответа (не вырывать отдельные фразы из контекста).
+
+6. **Generation + guardrails + sources**
+   - На основе финального контекста формируем prompt.
+   - Применяем постобработку:
+     - fact guards;
+     - sanitization реквизитов и источников;
+     - strict source reconstruction.
+   - Результат: структурированный пользовательский ответ + источники.
+
+### 12.3 Регрессия и контроль качества
+
+1. **Unit regression (pytest)**
+   - Основной набор: `tests/test_rag_critical_guard.py`.
+   - Проверяются:
+     - критичные факты;
+     - структура user-mode;
+     - обработка источников/реквизитов;
+     - сценарии “список документов”.
+
+2. **Functional eval**
+   - Скрипт: `scripts/eval_yandex_suite.py`.
+   - Сравнение прогонов: `scripts/compare_eval_runs.py`.
+   - Контрольный набор: `extra10`.
+
+---
+
+## 13. Глоссарий (расшифровка понятий)
+
+- `RAG` — Retrieval-Augmented Generation: генерация ответа с опорой на найденный контекст.
+- `TF-IDF` — статистический метод lexical ранжирования по важности токенов.
+- `Lexical index` — индекс токенов/весов для быстрого текстового поиска.
+- `Embedding` — векторное представление текста для семантического сравнения.
+- `Embeddings re-rank` — пересортировка lexical кандидатов по смысловой близости.
+- `Top-K` — число лучших фрагментов, попадающих в рабочий контекст.
+- `Top-N` — число кандидатов для этапа embeddings re-rank.
+- `Multi-step retrieval` — повторный поиск по уточняющим подзапросам.
+- `Parent-child expansion` — расширение матча соседними/связанными частями нормы.
+- `Hierarchy expansion` — расширение по структуре статьи и смежных чанков.
+- `Guardrails` — набор правил постпроверки для повышения надежности ответа.
+- `Fact guard` — специализированная проверка критичных фактов.
+- `Sanitization` — очистка ответа от шумных/сомнительных ссылок и артефактов.
+- `Strict source reconstruction` — пересборка блока источников только из retrieval-контекста.
+- `Official-only` — режим фильтрации в пользу официальных НПА.
+- `User-mode` — формат ответа для конечного пользователя (шаги, документы, источники).
+- `Fallback` — резервный режим при сбое внешнего API (например, lexical-only retrieval).
+- `Regression` — повторные тесты, проверяющие, что после изменений не ухудшилось качество.
