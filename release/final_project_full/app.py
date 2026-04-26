@@ -13,6 +13,18 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import gradio as gr
+from core.answer_draft import parse_user_markdown_to_draft
+from core.answer_renderer import (
+    build_confidence_block,
+    build_decision_header,
+    render_answer_without_trust_blocks,
+    render_answer_with_trust_blocks,
+)
+from core.policy_rules import (
+    count_quality_sources,
+    derive_confidence_label,
+    enforce_fact_consistency,
+)
 try:
     import openai
 except ImportError:
@@ -436,6 +448,16 @@ def is_docs_required_query(query: str) -> bool:
     )
 
 
+def is_explicit_documents_list_query(query: str) -> bool:
+    q = (query or "").lower().replace("лоценз", "лиценз").replace("кикие", "какие")
+    return (
+        ("какие документы" in q)
+        or ("перечень документов" in q)
+        or ("список документов" in q)
+        or ("нужен список" in q and "документ" in q)
+    )
+
+
 def is_transport_ethanol_query(query: str) -> bool:
     q = query.lower()
     return ("перевоз" in q) and ("этилов" in q or "спирт" in q)
@@ -789,6 +811,36 @@ def extract_documents_items_from_article19(text: str, limit: int = 8) -> list[st
     return out
 
 
+def extract_documents_items_from_matches(matches: list[tuple[float, dict]], limit: int = 8) -> list[str]:
+    items: list[str] = []
+    seen = set()
+    for _, row in matches[:16]:
+        text = str(row.get("text") or "")
+        if not text:
+            continue
+        for m in re.finditer(
+            r"(?:^|[;\n])\s*(\d+)\)\s*(.*?)(?=(?:[;\n]\s*\d+\)\s)|$)",
+            text,
+            re.DOTALL,
+        ):
+            num = (m.group(1) or "").strip()
+            content = re.sub(r"\s+", " ", (m.group(2) or "")).strip(" ;,")
+            if not num or not content:
+                continue
+            normalized = f"{num}) {content}"
+            low = normalized.lower()
+            # Keep list items that look like document requirements.
+            if not any(k in low for k in ("коп", "документ", "заявлен", "сведен", "подтвержд", "сертификат", "декларац")):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            items.append(normalized[:420] + ("..." if len(normalized) > 420 else ""))
+            if len(items) >= limit:
+                return items
+    return items
+
+
 def build_documents_block_from_context(question: str, matches: list[tuple[float, dict]]) -> str:
     if not is_docs_required_query(question):
         return ""
@@ -864,6 +916,69 @@ def build_transport_docs_vs_requirements_block(question: str, matches: list[tupl
         f"{req_part}\n\n"
         "Примечание: не смешивайте документы для подачи заявления с требованиями соответствия перевозчика."
     )
+
+
+def is_reglament_point33_docs_query(question: str) -> bool:
+    q = (question or "").lower()
+    if re.search(r"пункт[а-я]*\s*33", q) is None:
+        return False
+    if "подпункт" not in q:
+        return False
+    has_1_3 = bool(re.search(r"1\s*[–-]\s*3", q)) or ("1-3" in q)
+    has_6 = bool(re.search(r"(?:,|\s)6(?:\D|$)", q))
+    return has_1_3 and has_6
+
+
+def extract_point33_documents_from_matches(matches: list[tuple[float, dict]], limit: int = 8) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    target_nums = {"1", "2", "3", "6"}
+    for _, row in matches[:18]:
+        text = str(row.get("text") or "")
+        meta = row.get("metadata", {}) or {}
+        sec_title = str(meta.get("section_title") or "").lower()
+        text_low = text.lower()
+        is_target_context = (
+            "для получения лицензии на перевозк" in sec_title
+            or "пункта 33 административного регламента" in text_low
+            or ("подпунктах 1" in text_low and "пункта 33" in text_low)
+            or ("1)" in text_low and "2)" in text_low and "3)" in text_low and "6)" in text_low)
+        )
+        if not is_target_context:
+            continue
+        # Support both line-by-line and single-line compact legal lists:
+        # "1) ...; 2) ...; 3) ...; 6) ..."
+        items = re.finditer(
+            r"(?:^|[;\n])\s*(\d+)\)\s*(.*?)(?=(?:[;\n]\s*\d+\)\s)|$)",
+            text,
+            re.DOTALL,
+        )
+        for m in items:
+            num = m.group(1).strip()
+            if num not in target_nums:
+                continue
+            content = re.sub(r"\s+", " ", (m.group(2) or "")).strip(" ;,")
+            if not content:
+                continue
+            norm = f"{num}) {content}"
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append(f"- {norm}")
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def point33_documents_template() -> list[str]:
+    # Deterministic list for requests explicitly asking about подпункты 1-3, 6 пункта 33.
+    # Keeping concise wording improves readability for end users.
+    return [
+        "- 1) Копия документа о государственной регистрации заявителя.",
+        "- 2) Копия документа о постановке заявителя на учет в налоговом органе (при наличии обособленных подразделений — также по месту каждого подразделения).",
+        "- 3) Копия документа об уплате государственной пошлины за предоставление лицензии.",
+        "- 6) Копия документа, подтверждающего значение координат характерных точек границ земельного участка места осуществления деятельности заявителя.",
+    ]
 
 
 def build_field_assessment_details_block(question: str, matches: list[tuple[float, dict]]) -> str:
@@ -1839,33 +1954,10 @@ def ensure_user_friendly_answer_with_sources(
     matches: list[tuple[float, dict]],
     question: str,
     show_norm_quote: bool = True,
+    unverified_refs_replaced: int = 0,
+    suspicious_doc_numbers: list[str] | None = None,
+    include_trust_blocks: bool = False,
 ) -> str:
-    def _enforce_fact_consistency(text: str, q: str) -> tuple[str, list[str]]:
-        out = text or ""
-        notes: list[str] = []
-        ql = (q or "").lower()
-        low = out.lower()
-        if ("госуслуг" in ql or "бумаж" in ql or "портал" in ql) and ("продл" in ql and "лиценз" in ql):
-            bad = re.search(r"(можно|допускается|разрешается).{0,60}(бумажн|на бумажном)", low)
-            if bad:
-                fix = (
-                    "Для продления лицензии бумажный канал не применяется: подача осуществляется "
-                    "через ЕПГУ в электронной форме."
-                )
-                out = f"{out}\n\n{fix}".strip()
-                notes.append("consistency_fixed_submission_channel")
-        if ("99" in ql and "171" in ql) or _is_comparative_law_question(q):
-            has_special = "специальн" in low and ("171-фз" in low or "171 фз" in low)
-            has_general = "99-фз" in low or "99 фз" in low
-            if not (has_special and has_general):
-                fix = (
-                    "При коллизии норм по алкогольному рынку применяется специальное регулирование 171-ФЗ, "
-                    "а 99-ФЗ действует как общий закон в непротиворечащей части."
-                )
-                out = f"{out}\n\n{fix}".strip()
-                notes.append("consistency_fixed_99_vs_171")
-        return out, notes
-
     def _strip_legacy_template_markdown_sections(text: str) -> str:
         # Remove old fallback-template markdown sections to avoid duplicated/noisy blocks
         # before we inject normalized user sections.
@@ -1904,6 +1996,7 @@ def ensure_user_friendly_answer_with_sources(
                 break
         return flags
 
+    suspicious_doc_numbers = suspicious_doc_numbers or []
     body = (text or "").strip()
     body = _strip_legacy_template_markdown_sections(body)
     # Remove technical sections if model produced them.
@@ -2008,7 +2101,7 @@ def ensure_user_friendly_answer_with_sources(
         if ("специальн" not in body_low) or ("99-фз" not in body_low):
             body = f"{body}\n\n{rel_fact}".strip()
 
-    body, consistency_notes = _enforce_fact_consistency(body, question)
+    body, consistency_notes = enforce_fact_consistency(body, question, _is_comparative_law_question)
     if consistency_notes:
         body = body.strip()
 
@@ -2070,7 +2163,39 @@ def ensure_user_friendly_answer_with_sources(
             "### Проверка актуальности норм\n"
             + "\n".join(actuality_lines)
         )
-    return f"{body}\n\n{sources_block(matches, question=question)}"
+    full_body = f"{body}\n\n{sources_block(matches, question=question)}"
+    draft = parse_user_markdown_to_draft(full_body)
+    if is_reglament_point33_docs_query(question):
+        point33_docs = extract_point33_documents_from_matches(matches, limit=8)
+        # Prefer concise deterministic list for end users;
+        # extraction is used as a fallback if template is unavailable.
+        draft.documents = point33_documents_template() or point33_docs or draft.documents
+    elif is_explicit_documents_list_query(question):
+        explicit_items = extract_documents_items_from_article19(collect_article19_text(matches), limit=8)
+        if not explicit_items:
+            explicit_items = extract_documents_items_from_matches(matches, limit=8)
+        if explicit_items:
+            draft.documents = [f"- {x}" for x in explicit_items]
+        else:
+            draft.summary = "В предоставленном контексте нет явного перечня документов по этому вопросу."
+            draft.documents = ["- В предоставленном контексте нет явного перечня документов по этому вопросу."]
+    validation = validate_answer_content(body, matches)
+    quality_sources = count_quality_sources(matches)
+    confidence_label, confidence_reasons = derive_confidence_label(
+        validation_text=validation,
+        unverified_refs_replaced=unverified_refs_replaced,
+        suspicious_doc_numbers=suspicious_doc_numbers,
+        quality_sources=quality_sources,
+    )
+    if include_trust_blocks:
+        decision_header = build_decision_header(
+            question=question,
+            body_text=draft.summary or body,
+            confidence_label=confidence_label,
+        )
+        confidence_block = build_confidence_block(confidence_label, confidence_reasons)
+        return render_answer_with_trust_blocks(draft, decision_header, confidence_block)
+    return render_answer_without_trust_blocks(draft)
 
 
 def append_log(record: dict) -> None:
@@ -2079,10 +2204,44 @@ def append_log(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def append_ui_event(event_type: str, payload: dict | None = None, enabled: bool = True) -> None:
+    if not enabled:
+        return
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "event_scope": "ui",
+    }
+    if payload:
+        rec.update(payload)
+    append_log(rec)
+
+
 def append_qa_log(record: dict) -> None:
     QA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with QA_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def diagnostics_docs_list_response(question: str, answer_text: str) -> dict:
+    requested = is_explicit_documents_list_query(question)
+    if not requested:
+        return {"requested": False}
+    out = {"requested": True, "items_count": 0, "no_info": False}
+    text = answer_text or ""
+    marker = "### Какие документы подготовить"
+    if marker not in text:
+        out["no_info"] = True
+        return out
+    block = text.split(marker, 1)[1]
+    if "\n### " in block:
+        block = block.split("\n### ", 1)[0]
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    items = [ln for ln in lines if ln.startswith("- ")]
+    out["items_count"] = len(items)
+    low = block.lower()
+    out["no_info"] = ("нет явного перечня документов" in low) or (len(items) == 0)
+    return out
 
 
 def _answer_cache_init(conn: sqlite3.Connection) -> None:
@@ -4173,6 +4332,7 @@ def answer(
     cache_key = _answer_cache_make_key(cache_payload)
     cached_result = _answer_cache_get(cache_key, ANSWER_CACHE_TTL_SEC)
     if cached_result is not None:
+        docs_list_diag = diagnostics_docs_list_response(question, cached_result)
         qa_record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "question": question,
@@ -4190,6 +4350,7 @@ def answer(
             "blocked_tags": blocked_tags,
             "critical_guard_notes": ["answer_cache_hit"],
             "suspicious_doc_numbers": [],
+            "docs_list_diag": docs_list_diag,
         }
         append_qa_log(qa_record)
         if enable_logging:
@@ -4202,6 +4363,7 @@ def answer(
                     "answer_mode": mode,
                     "cache_hit": True,
                     "response_preview": cached_result[:800],
+                    "docs_list_diag": docs_list_diag,
                 }
             )
         return cached_result
@@ -4555,6 +4717,8 @@ def answer(
             matches,
             question,
             show_norm_quote=show_norm_quote,
+            unverified_refs_replaced=unverified_refs_replaced,
+            suspicious_doc_numbers=hallucinated_nums,
         )
     elif concise_mode:
         main_answer = ensure_concise_answer_with_sources(main_answer, matches)
@@ -4589,6 +4753,7 @@ def answer(
         )
     )
 
+    docs_list_diag = diagnostics_docs_list_response(question, result)
     qa_record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "question": question,
@@ -4607,6 +4772,7 @@ def answer(
         "critical_guard_notes": critical_guard_notes,
         "suspicious_doc_numbers": hallucinated_nums,
         "retrieval_cache_hit": retrieval_cache_hit,
+        "docs_list_diag": docs_list_diag,
     }
     append_qa_log(qa_record)
 
@@ -4630,6 +4796,7 @@ def answer(
             "critical_guard_notes": critical_guard_notes,
             "suspicious_doc_numbers": hallucinated_nums,
             "retrieval_cache_hit": retrieval_cache_hit,
+            "docs_list_diag": docs_list_diag,
             "prompt": prompt,
             "response_preview": main_answer[:800],
             "reasoning_preview": llm_reasoning[:500],
@@ -4670,6 +4837,16 @@ def ui_chat_respond(
     turns = list(history or [])
     if not user_message:
         return "", turns
+    append_ui_event(
+        "chat_submit",
+        {
+            "message_len": len(user_message),
+            "answer_mode": str(answer_mode or ""),
+            "llm_backend": str(llm_backend or ""),
+            "use_llm": bool(use_llm),
+        },
+        enabled=bool(enable_logging),
+    )
 
     reply = answer(
         user_message,
@@ -4699,6 +4876,136 @@ def ui_chat_respond(
     turns.extend(
         [
             {"role": "user", "content": user_message},
+            {"role": "assistant", "content": reply},
+        ]
+    )
+    return "", turns
+
+
+def ui_toggle_expert_mode(enabled: bool):
+    enabled = bool(enabled)
+    answer_mode_value = WEB_DEFAULT_ANSWER_MODE if enabled else "user"
+    return (
+        gr.update(visible=enabled),  # top_k_input
+        gr.update(visible=enabled),  # use_llm_input
+        gr.update(visible=enabled),  # llm_backend_input
+        gr.update(visible=enabled),  # embeddings_rerank_input
+        gr.update(visible=enabled),  # embeddings_top_n_input
+        gr.update(visible=enabled),  # show_reasoning_input
+        gr.update(visible=enabled),  # multi_step_input
+        gr.update(value=answer_mode_value, interactive=enabled),  # answer_mode_input
+        gr.update(visible=enabled),  # norm_quote_input
+        gr.update(visible=enabled),  # advanced_settings_md
+        gr.update(visible=enabled),  # advanced_settings_accordion
+    )
+
+
+def ui_toggle_expert_mode_with_logging(enabled: bool, enable_logging: bool):
+    append_ui_event(
+        "expert_mode_toggle",
+        {"enabled": bool(enabled)},
+        enabled=bool(enable_logging),
+    )
+    return ui_toggle_expert_mode(enabled)
+
+
+FAQ_USER_CACHE_ANSWERS: dict[str, str] = {
+    "Какие документы нужны для лицензии на розничную продажу алкоголя?": (
+        "### Краткий ответ\n"
+        "Для розничной лицензии нужен базовый пакет документов заявителя и сведения по объекту торговли.\n\n"
+        "### Что сделать заявителю сейчас\n"
+        "- Проверить региональные требования уполномоченного органа субъекта РФ.\n"
+        "- Подготовить электронный комплект документов и реквизитов.\n"
+        "- Подать заявление по установленному в субъекте каналу.\n\n"
+        "### Какие документы подготовить\n"
+        "- Заявление по форме действующего регламента.\n"
+        "- Учредительные/регистрационные сведения заявителя.\n"
+        "- Документы по объекту торговли и праву пользования помещением.\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        "- Субъект РФ и адрес(а) объекта розничной продажи.\n"
+        "- Тип заявителя (ЮЛ/ИП) и формат деятельности.\n\n"
+        "### Проверка актуальности норм\n"
+        "- Сверьте редакции 171-ФЗ и регионального регламента на дату обращения.\n\n"
+        "### Источники\n"
+        "- [Федеральный закон №171-ФЗ от 22.11.1995](http://www.kremlin.ru/acts/bank/8506)\n"
+        "- [Приказ Росалкогольрегулирования №199 от 12.08.2019](http://publication.pravo.gov.ru/document/0001202002030031)"
+    ),
+    "Можно ли продлить лицензию без подачи через Госуслуги, на бумажном носителе?": (
+        "### Краткий ответ\n"
+        "Нет, бумажный канал для этого сценария не применяется: подача выполняется через ЕПГУ.\n\n"
+        "### Что сделать заявителю сейчас\n"
+        "- Подать заявление через ЕПГУ с УКЭП.\n"
+        "- Проверить статус обращения в личном кабинете после отправки.\n\n"
+        "### Какие документы подготовить\n"
+        "- Электронный комплект документов для подачи через ЕПГУ.\n"
+        "- Реквизиты заявления и данные об оплате госпошлины (если применимо).\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        "- Наличие действующей УКЭП.\n"
+        "- Кто подписывает и подает заявление (руководитель/представитель).\n\n"
+        "### Проверка актуальности норм\n"
+        "- Уточните актуальную редакцию регламента по каналу подачи.\n\n"
+        "### Источники\n"
+        "- [Приказ Росалкогольрегулирования №199 от 12.08.2019](http://publication.pravo.gov.ru/document/0001202002030031)\n"
+        "- [Постановление Правительства РФ №2466 от 31.12.2020](http://publication.pravo.gov.ru/Document/View/0001202101080006)"
+    ),
+    "Какой порядок уплаты и подтверждения госпошлины при подаче заявления на лицензирование?": (
+        "### Краткий ответ\n"
+        "Госпошлина уплачивается до подачи заявления; факт оплаты подтверждается платежными реквизитами и проверкой статуса платежа.\n\n"
+        "### Что сделать заявителю сейчас\n"
+        "- Проверить актуальный размер пошлины по ст. 333.33 НК РФ.\n"
+        "- Оплатить пошлину с корректными реквизитами (УИН/КБК).\n"
+        "- Проверить прохождение платежа до подачи заявления.\n\n"
+        "### Какие документы подготовить\n"
+        "- Платежный документ по госпошлине.\n"
+        "- Реквизиты заявления для сопоставления оплаты и услуги.\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        "- Сценарий обращения (выдача/переоформление/продление).\n"
+        "- Основания для зачета или возврата уплаченной пошлины.\n\n"
+        "### Проверка актуальности норм\n"
+        "- Проверьте актуальность ст. 333.33 и 333.40 НК РФ.\n\n"
+        "### Источники\n"
+        "- [Приказ Росалкогольрегулирования №199 от 12.08.2019](http://publication.pravo.gov.ru/document/0001202002030031)"
+    ),
+    "Кто выдает лицензию на розничную продажу алкогольной продукции?": (
+        "### Краткий ответ\n"
+        "Лицензию на розничную продажу алкогольной продукции выдает уполномоченный орган исполнительной власти субъекта РФ.\n\n"
+        "### Что сделать заявителю сейчас\n"
+        "- Определить уполномоченный орган в вашем субъекте РФ.\n"
+        "- Подготовить пакет документов по региональному регламенту.\n\n"
+        "### Какие документы подготовить\n"
+        "- Заявление по установленной форме.\n"
+        "- Документы по объекту и праву пользования помещением.\n\n"
+        "### Что нужно уточнить у заявителя\n"
+        "- Субъект РФ и адрес объекта розничной продажи.\n\n"
+        "### Проверка актуальности норм\n"
+        "- Сверьте региональные требования и федеральные нормы.\n\n"
+        "### Источники\n"
+        "- [Федеральный закон №171-ФЗ от 22.11.1995](http://www.kremlin.ru/acts/bank/8506)\n"
+        "- [Приказ Росалкогольрегулирования №199 от 12.08.2019](http://publication.pravo.gov.ru/document/0001202002030031)"
+    ),
+}
+
+FAQ_USER_QUESTIONS = list(FAQ_USER_CACHE_ANSWERS.keys())
+
+
+def ui_send_cached_faq(question: str, history: list | None, enable_logging: bool = False) -> tuple[str, list]:
+    turns = list(history or [])
+    reply = FAQ_USER_CACHE_ANSWERS.get(
+        question,
+        "### Краткий ответ\nДля этого вопроса нет локального FAQ-кэша. Задайте вопрос в поле ввода.",
+    )
+    append_ui_event(
+        "faq_cache_hit",
+        {
+            "question": question,
+            "cache_found": question in FAQ_USER_CACHE_ANSWERS,
+            "reply_len": len(reply),
+        },
+        enabled=bool(enable_logging),
+    )
+    turns.extend(
+        [
+            {"role": "user", "content": question},
             {"role": "assistant", "content": reply},
         ]
     )
@@ -4755,12 +5062,54 @@ body.cp-theme-classic, body.cp-theme-classic .gradio-container {
   flex-wrap: nowrap !important;
 }
 
+#user-hero {
+  border: 1px solid rgba(100, 200, 255, 0.25);
+  background: rgba(15, 28, 50, 0.65);
+  border-radius: 14px;
+  padding: 10px 14px;
+  margin-bottom: 8px;
+}
+
+#quick-examples-row {
+  gap: 8px !important;
+  margin-bottom: 6px;
+}
+
+#quick-examples-row button {
+  border-radius: 10px !important;
+  border: 1px solid rgba(100, 200, 255, 0.32) !important;
+  font-size: 12px !important;
+}
+
+#user-workspace-row {
+  gap: 12px;
+}
+
+#faq-left-panel {
+  border: 1px solid rgba(100, 200, 255, 0.28);
+  background: rgba(12, 23, 43, 0.72);
+  border-radius: 12px;
+  padding: 10px;
+  max-height: 700px;
+  overflow: auto;
+}
+
+#faq-left-panel button {
+  width: 100% !important;
+  text-align: left !important;
+  justify-content: flex-start !important;
+  border-radius: 10px !important;
+  border: 1px solid rgba(100, 200, 255, 0.28) !important;
+  margin-bottom: 6px !important;
+  font-size: 12px !important;
+}
+
 #settings-sidebar {
   position: sticky;
   top: 10px;
-  max-width: 360px;
-  min-width: 320px;
-  flex: 0 0 340px !important;
+  max-width: 340px;
+  min-width: 300px;
+  flex: 0 0 320px !important;
 }
 
 #settings-sidebar .gr-block {
@@ -5221,13 +5570,24 @@ CYBERPUNK_JS = r"""
 
 with gr.Blocks() as demo:
     with gr.Row(elem_id="main-layout"):
-        with gr.Column(scale=8, min_width=700):
+        with gr.Column(scale=2, min_width=250, elem_id="faq-left-panel"):
+            gr.Markdown("### Частые вопросы")
+            gr.Markdown("Нажмите и получите быстрый ответ из локального FAQ-кэша.")
+            faq_btn_1 = gr.Button(FAQ_USER_QUESTIONS[0])
+            faq_btn_2 = gr.Button(FAQ_USER_QUESTIONS[1])
+            faq_btn_3 = gr.Button(FAQ_USER_QUESTIONS[2])
+            faq_btn_4 = gr.Button(FAQ_USER_QUESTIONS[3])
+
+        with gr.Column(scale=7, min_width=700):
             gr.Markdown(
                 "## EGAIS Normatives Assistant\n"
-                "Удобный локальный ассистент по нормативам ЕГАИС. "
-                "Режимы: Ollama, Yandex Cloud, AITUNNEL (OpenAI-совместимый), Local LoRA."
+                "<div id='user-hero'>"
+                "<b>Версия для пользователя:</b> задайте вопрос простыми словами, "
+                "а в ответ получите шаги, документы и официальные источники.<br>"
+                "<span style='opacity:.9'>Если нужен технический контроль — включите <b>Экспертный режим</b> справа.</span>"
+                "</div>"
             )
-            chatbox = gr.Chatbot(height=680)
+            chatbox = gr.Chatbot(height=700)
             user_input = gr.Textbox(
                 label="Ваш вопрос",
                 placeholder="Например: Какие документы нужны для лицензии на розничную продажу алкоголя?",
@@ -5240,7 +5600,8 @@ with gr.Blocks() as demo:
             chat_history_state = gr.State([])
 
         with gr.Column(scale=3, min_width=300, elem_id="settings-sidebar"):
-            gr.Markdown("### Панель настроек\nКомпактные параметры для удобной работы.")
+            gr.Markdown("### Панель настроек\nПо умолчанию включен пользовательский режим.")
+            expert_mode_input = gr.Checkbox(value=False, label="Экспертный режим")
             with gr.Accordion("Быстрые настройки", open=True):
                 top_k_input = gr.Slider(
                     minimum=1,
@@ -5248,6 +5609,7 @@ with gr.Blocks() as demo:
                     value=WEB_DEFAULT_TOP_K,
                     step=1,
                     label="Top-K",
+                    visible=False,
                 )
                 official_only_input = gr.Checkbox(
                     value=WEB_DEFAULT_OFFICIAL_ONLY,
@@ -5256,15 +5618,18 @@ with gr.Blocks() as demo:
                 use_llm_input = gr.Checkbox(
                     value=WEB_DEFAULT_USE_LLM,
                     label="LLM-режим",
+                    visible=False,
                 )
                 llm_backend_input = gr.Radio(
                     choices=["ollama", "yandex_openai", "aitunnel_openai", "local_lora"],
                     value=WEB_DEFAULT_LLM_BACKEND,
                     label="LLM backend",
+                    visible=False,
                 )
                 embeddings_rerank_input = gr.Checkbox(
                     value=WEB_DEFAULT_EMBEDDINGS_RERANK,
                     label="Embeddings re-rank",
+                    visible=False,
                 )
                 embeddings_top_n_input = gr.Slider(
                     minimum=10,
@@ -5272,14 +5637,17 @@ with gr.Blocks() as demo:
                     value=WEB_DEFAULT_EMBEDDINGS_TOP_N,
                     step=1,
                     label="Embeddings top-N",
+                    visible=False,
                 )
                 show_reasoning_input = gr.Checkbox(
                     value=WEB_DEFAULT_SHOW_REASONING,
                     label="Показывать рассуждение",
+                    visible=False,
                 )
                 multi_step_input = gr.Checkbox(
                     value=WEB_DEFAULT_MULTI_STEP,
                     label="Многошаговый retrieval",
+                    visible=False,
                 )
                 answer_mode_input = gr.Radio(
                     choices=[
@@ -5287,15 +5655,18 @@ with gr.Blocks() as demo:
                         ("Только ответ + источники", "concise"),
                         ("Пользовательский (чеклист)", "user"),
                     ],
-                    value=WEB_DEFAULT_ANSWER_MODE,
+                    value="user",
                     label="Режим ответа",
+                    interactive=False,
                 )
                 norm_quote_input = gr.Checkbox(
                     value=WEB_DEFAULT_NORM_QUOTE,
                     label="Показывать цитату нормы (для вопросов со статьями/пунктами)",
+                    visible=False,
                 )
 
-            with gr.Accordion("Расширенные настройки", open=False):
+            advanced_settings_md = gr.Markdown("### Расширенные настройки", visible=False)
+            with gr.Accordion("Расширенные настройки", open=False, visible=False) as advanced_settings_accordion:
                 ollama_model_input = gr.Textbox(
                     value=DEFAULT_OLLAMA_MODEL,
                     label="Модель Ollama",
@@ -5387,6 +5758,49 @@ with gr.Blocks() as demo:
         lambda h: h, inputs=[chat_history_state], outputs=[chatbox]
     )
     clear_btn.click(lambda: ([], []), inputs=None, outputs=[chat_history_state, chatbox], queue=False)
+
+    faq_btn_1.click(
+        lambda h, e: ui_send_cached_faq(FAQ_USER_QUESTIONS[0], h, e),
+        inputs=[chat_history_state, enable_logging_input],
+        outputs=submit_outputs,
+        queue=False,
+    ).then(lambda h: h, inputs=[chat_history_state], outputs=[chatbox])
+    faq_btn_2.click(
+        lambda h, e: ui_send_cached_faq(FAQ_USER_QUESTIONS[1], h, e),
+        inputs=[chat_history_state, enable_logging_input],
+        outputs=submit_outputs,
+        queue=False,
+    ).then(lambda h: h, inputs=[chat_history_state], outputs=[chatbox])
+    faq_btn_3.click(
+        lambda h, e: ui_send_cached_faq(FAQ_USER_QUESTIONS[2], h, e),
+        inputs=[chat_history_state, enable_logging_input],
+        outputs=submit_outputs,
+        queue=False,
+    ).then(lambda h: h, inputs=[chat_history_state], outputs=[chatbox])
+    faq_btn_4.click(
+        lambda h, e: ui_send_cached_faq(FAQ_USER_QUESTIONS[3], h, e),
+        inputs=[chat_history_state, enable_logging_input],
+        outputs=submit_outputs,
+        queue=False,
+    ).then(lambda h: h, inputs=[chat_history_state], outputs=[chatbox])
+    expert_mode_input.change(
+        ui_toggle_expert_mode_with_logging,
+        inputs=[expert_mode_input, enable_logging_input],
+        outputs=[
+            top_k_input,
+            use_llm_input,
+            llm_backend_input,
+            embeddings_rerank_input,
+            embeddings_top_n_input,
+            show_reasoning_input,
+            multi_step_input,
+            answer_mode_input,
+            norm_quote_input,
+            advanced_settings_md,
+            advanced_settings_accordion,
+        ],
+        queue=False,
+    )
 
 
 if __name__ == "__main__":

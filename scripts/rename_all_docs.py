@@ -62,10 +62,10 @@ def normalize_token(token: str | None) -> str | None:
     return s or None
 
 
-def content_text(path: Path) -> str:
+def content_text(path: Path, input_dir: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".rtf":
-        _, text = process_file(path)
+        _, text = process_file(path, input_dir)
         return text
     if ext == ".docx":
         return extract_docx_text(path)
@@ -94,7 +94,7 @@ def main() -> None:
 
     for path in files:
         ext = path.suffix.lower()
-        text = content_text(path)
+        text = content_text(path, doc_dir)
         number = normalize_token(extract_number(text)) if text else None
         date = extract_date(text) if text else None
 

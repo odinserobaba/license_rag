@@ -1,8 +1,12 @@
-# Python cache / venv
+# Python cache / virtualenv
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
 .python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
 # IDE / OS
 .DS_Store
@@ -13,16 +17,26 @@ Thumbs.db
 *.tmp
 *.bak
 
-# Project artifacts
-processed/
-!processed/.gitkeep
+# Local environment files
+.env
+.env.local
+.env.*
+!.env.example
+!.env.final.example
+
+# Runtime and transient artifacts
+processed/answer_cache.sqlite
+processed/embedding_cache.json
+processed/*tmp*
+processed/*.log
 doc/rename_map*.tsv
 *.log
 
-# Local models and heavy assets
+# Local heavy assets
 models/
 chroma_db/
 
-# Jupyter / pytest / local caches
-.ipynb_checkpoints/
-.pytest_cache/
+# Build archives
+*.zip
+*.tar
+*.tar.gz

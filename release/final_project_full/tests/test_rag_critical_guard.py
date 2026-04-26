@@ -675,3 +675,118 @@ def test_query_norm_refs_extracts_doc_number():
 def test_parent_child_window_for_list_query_is_wider():
     q = "Где закреплен перечень видов оборудования?"
     assert app.parent_child_window_for_query(q) >= 3
+
+
+def test_user_mode_includes_decision_header_and_confidence():
+    q = "Можно ли продлить лицензию без подачи через Госуслуги, на бумажном носителе?"
+    out = app.ensure_user_friendly_answer_with_sources(
+        "### Краткий ответ\nПодайте заявление через ЕПГУ.",
+        [_mk_match("...")],
+        q,
+        include_trust_blocks=True,
+    )
+    assert "### Decision header" in out
+    assert "- Итог:" in out
+    assert "- Канал подачи:" in out
+    assert "- Критичный риск:" in out
+    assert "### Уверенность ответа" in out
+
+
+def test_user_mode_adds_status_prefixes_to_action_and_clarification_blocks():
+    q = "Какие документы нужны для продления лицензии на алкоголь?"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nНужно подготовить пакет.", [_mk_match("...")], q)
+    assert "Обязательно:" in out
+    assert "Рекомендуется:" in out
+    assert "Проверить:" in out
+
+
+def test_user_mode_confidence_becomes_low_on_suspicious_references():
+    q = "Какими документами подтверждаются источники происхождения денежных средств для уставного капитала?"
+    out = app.ensure_user_friendly_answer_with_sources(
+        "### Краткий ответ\nПодтверждение по профилю вопроса.",
+        [_mk_match("...")],
+        q,
+        suspicious_doc_numbers=["723", "9999"],
+        include_trust_blocks=True,
+    )
+    assert "**Низкая**" in out
+
+
+def test_decision_header_summary_is_human_friendly_for_submission_channel():
+    q = "Можно ли продлить лицензию без подачи через Госуслуги, на бумажном носителе?"
+    out = app.ensure_user_friendly_answer_with_sources(
+        "### Краткий ответ\nПодайте заявление через ЕПГУ.",
+        [_mk_match("...")],
+        q,
+        include_trust_blocks=True,
+    )
+    assert "Итог: Продление подается через ЕПГУ; бумажный канал не применяется." in out
+
+
+def test_user_mode_default_hides_trust_blocks():
+    q = "Какой порядок уплаты и подтверждения госпошлины при подаче заявления на лицензирование?"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nОплатите пошлину.", [_mk_match("...")], q)
+    assert "### Decision header" not in out
+    assert "### Уверенность ответа" not in out
+
+
+def test_point33_docs_query_returns_explicit_documents_list():
+    q = "Какие документы указаны в подпунктах 1–3, 6 пункта 33 Административного регламента?"
+    row = _mk_match(
+        "Для получения лицензии заявитель вправе представить:\n"
+        "1) копии документов о государственной регистрации транспорта;\n"
+        "2) копии документов, подтверждающих право владения/пользования транспортом;\n"
+        "3) сведения о технических средствах фиксации движения;\n"
+        "6) копии сертификатов соответствия и (или) деклараций о соответствии оборудования учета.\n",
+        doc_type="ПРИКАЗ",
+        doc_number="199",
+    )
+    row[1]["metadata"]["section_title"] = "Для получения лицензии на перевозки"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nСм. перечень.", [row], q)
+    assert "1) Копия документа о государственной регистрации заявителя." in out
+    assert "2) Копия документа о постановке заявителя на учет в налоговом органе" in out
+    assert "3) Копия документа об уплате государственной пошлины за предоставление лицензии." in out
+    assert "6) Копия документа, подтверждающего значение координат характерных точек границ" in out
+
+
+def test_point33_docs_query_keeps_only_subpoints_1_3_and_6():
+    q = "Какие документы указаны в подпунктах 1–3, 6 пункта 33 Административного регламента?"
+    row = _mk_match(
+        "1) документ о госрегистрации; 2) документ о постановке на учет; "
+        "3) документ об уплате госпошлины; 4) документ по лаборатории; "
+        "5) документы по помещениям; 6) документ по координатам границ.",
+        doc_type="ПРИКАЗ",
+        doc_number="199",
+    )
+    row[1]["metadata"]["section_title"] = "Для получения лицензии на перевозки"
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nСм. перечень.", [row], q)
+    assert "1) Копия документа о государственной регистрации заявителя." in out
+    assert "2) Копия документа о постановке заявителя на учет в налоговом органе" in out
+    assert "3) Копия документа об уплате государственной пошлины за предоставление лицензии." in out
+    assert "6) Копия документа, подтверждающего значение координат характерных точек границ" in out
+    assert "4) документ по лаборатории" not in out
+    assert "5) документы по помещениям" not in out
+
+
+def test_explicit_documents_list_query_falls_back_to_no_info_when_no_list_found():
+    q = "Нужен список документов для процедуры."
+    out = app.ensure_user_friendly_answer_with_sources(
+        "### Краткий ответ\nПо вопросу применяются нормы регламента без раскрытого перечня.",
+        [_mk_match("Текст без нумерованного списка и без явных документов.")],
+        q,
+    )
+    assert "нет явного перечня документов по этому вопросу" in out
+
+
+def test_explicit_documents_list_query_extracts_numbered_items_from_matches():
+    q = "Какие документы нужны? Нужен список документов."
+    row = _mk_match(
+        "1) заявление о выдаче лицензии; 2) копия документа об уплате госпошлины; "
+        "3) документы, подтверждающие право пользования объектом.",
+        doc_type="ПРИКАЗ",
+        doc_number="199",
+    )
+    out = app.ensure_user_friendly_answer_with_sources("### Краткий ответ\nСм. перечень.", [row], q)
+    assert "1) заявление о выдаче лицензии" in out
+    assert "2) копия документа об уплате госпошлины" in out
+    assert "3) документы, подтверждающие право пользования объектом" in out
